@@ -16,7 +16,7 @@ except ImportError:
 # BACKEND HOOK
 # ---------------------------------------------------------------------------
 try:
-    from backend import get_bot_response
+    from backend.backend import get_bot_response
 except ImportError:
     def get_bot_response(cust_id: str, user_input: str, thread_id: str) -> str:
         """Stub backend - replace by adding backend.py (see get_bot_response there)."""
