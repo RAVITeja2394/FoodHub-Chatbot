@@ -1,0 +1,29 @@
+name: "FoodHub-Chatbot"
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "Install dependencies"
+        run: pip install -r requirements.txt
+
+      - name: "Lint check"
+        run: |
+          pip install ruff
+          ruff check .
+
+      - name: "Import smoke test"
+        env:
+          GEMINI_TOKEN: ${{ secrets.GEMINI_TOKEN }}
+        run: python -c "import backend.backend"
