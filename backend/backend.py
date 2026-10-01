@@ -41,7 +41,10 @@ os.environ["PYMUPDF_MESSAGE"] = ""    # To supress OCR messages in Retreiver
 
 # Load the Gemini API key from Colab's secrets manager (Settings -> Secrets)
 
+
 gemini_key = os.environ.get("GEMINI_TOKEN")
+if not gemini_key:
+       raise ValueError("GEMINI_TOKEN environment variable is not set.")
 
 # Resolve SQLite database file path dynamically for Google Colab (/content) or local execution
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "customer_orders.db")
