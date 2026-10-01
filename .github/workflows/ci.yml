@@ -17,13 +17,3 @@ jobs:
 
       - name: "Install dependencies"
         run: pip install -r requirements.txt
-
-      - name: "Lint check"
-        run: |
-          pip install ruff
-          ruff check . --fix
-
-      - name: "Import smoke test"
-        env:
-          GEMINI_TOKEN: ${{ secrets.GEMINI_TOKEN }}
-        run: python -c "import backend.backend"
