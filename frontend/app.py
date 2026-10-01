@@ -107,9 +107,13 @@ def handle_user_message(text: str):
         add_message("assistant", "Session ended. Thank you for contacting FoodHub!")
         st.session_state.session_active = False
     else:
-        reply = get_bot_response(st.session_state.cust_id, text, st.session_state.thread_id)
+        with st.spinner("Thinking..."):
+            try:
+                reply = get_bot_response(st.session_state.cust_id, text, st.session_state.thread_id)
+            except Exception as e:
+                reply = f"Sorry, something went wrong: {e}"
         add_message("assistant", reply)
-        st.session_state.last_active = time.time()   # <-- added: reset timer AFTER bot replies
+        st.session_state.last_active = time.time()
 
 
 # ---------------------------------------------------------------------------
