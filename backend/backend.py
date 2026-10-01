@@ -47,7 +47,10 @@ if not gemini_key:
        raise ValueError("GEMINI_TOKEN environment variable is not set.")
 
 # Resolve SQLite database file path dynamically for Google Colab (/content) or local execution
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "customer_orders.db")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # backend/ -> repo root
+DB_PATH = os.path.join(BASE_DIR, "data", "customer_orders.db")
+
+
 
 # Initialize LangChain SQLDatabase connection wrapper with target SQLite URI
 db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
@@ -588,7 +591,7 @@ def formatter_node(state: AgentState):
 
     return {"messages": [AIMessage(content=content)]}
 
-PDF_PATH = os.path.join(os.path.dirname(__file__), "data", "Food_Delivery_Policy_final.pdf")
+PDF_PATH = os.path.join(BASE_DIR, "data", "Food_Delivery_Policy_final.pdf")
 retriever = get_retreiver(PDF_PATH)
 
 def rag_node(state: AgentState):
