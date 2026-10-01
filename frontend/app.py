@@ -109,6 +109,7 @@ def handle_user_message(text: str):
     else:
         reply = get_bot_response(st.session_state.cust_id, text, st.session_state.thread_id)
         add_message("assistant", reply)
+        st.session_state.last_active = time.time()   # <-- added: reset timer AFTER bot replies
 
 
 # ---------------------------------------------------------------------------
