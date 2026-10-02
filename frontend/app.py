@@ -191,6 +191,7 @@ def queue_user_message(text: str):
     st.session_state.awaiting_text = text
     request_id = str(uuid.uuid4())
     st.session_state.pending_request_id = request_id
+    st.session_state.duplicate_log_at = 0
     _register_request(st.session_state.thread_id, request_id)
 
 
@@ -203,7 +204,11 @@ def process_pending_message():
     status, cached_reply = _claim_request(thread_id, request_id)
 
     if status == "running":
-        print(f"[{now_str()}] APP: duplicate run blocked by active backend request", flush=True)
+        # Do not spam logs on every 2s polling rerun. The backend request is still active.
+        last_log = st.session_state.get("duplicate_log_at", 0)
+        if time.time() - last_log >= 15:
+            print(f"[{now_str()}] APP: waiting for active backend request", flush=True)
+            st.session_state.duplicate_log_at = time.time()
         if AUTOREFRESH_AVAILABLE:
             st_autorefresh(interval=2000, key=f"wait_for_reply_{request_id}")
         return False
