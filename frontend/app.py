@@ -2,6 +2,7 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 import uuid
+import threading
 from datetime import datetime
 
 import streamlit as st
@@ -50,6 +51,24 @@ WELCOME_MSG = "Hi! How can I help you today?"
 st.set_page_config(page_title="FoodHub ChatBot", page_icon="🍔", layout="wide")
 
 
+@st.cache_resource
+def _get_call_locks():
+    """Persistent per-process lock registry shared across Streamlit reruns.
+
+    Session-state booleans are not sufficient for concurrent Streamlit script runs: two
+    runs can read the same value before either one writes it. A real threading.Lock
+    prevents the same conversation from entering the backend twice.
+    """
+    return {}
+
+
+def _get_call_lock(thread_id):
+    locks = _get_call_locks()
+    if thread_id not in locks:
+        locks[thread_id] = threading.Lock()
+    return locks[thread_id]
+
+
 # ---------------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------------
@@ -65,9 +84,8 @@ defaults = {
     "processing": False,
     "awaiting_text": None,
     "closing_message": None,
-    "call_in_progress": False,   # reentrancy guard: True while get_bot_response is running
+    "call_in_progress": False,   # reentrancy lock: True while get_bot_response is running
     "call_started_at": None,
-    "request_id": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -88,7 +106,6 @@ def start_session(cust_id: str):
     st.session_state.closing_message = None
     st.session_state.call_in_progress = False
     st.session_state.call_started_at = None
-    st.session_state.request_id = None
     st.session_state.processing = False
     st.session_state.awaiting_text = None
     if not st.session_state.greeted:
@@ -128,27 +145,34 @@ def queue_user_message(text: str):
 
 
 def process_pending_message():
-    """Run the one pending backend request and always clear its state afterward."""
+    """Execute the pending request and ALWAYS settle frontend state, even on errors."""
     text = st.session_state.awaiting_text
+    try:
+        if text and text.strip().lower() in EXIT_KEYWORDS:
+            print(f"[{now_str()}] APP: exit keyword matched, session ended", flush=True)
+            end_session("Session ended. Thank you for contacting FoodHub!")
+            return
 
-    if text.strip().lower() in EXIT_KEYWORDS:
-        print(f"[{now_str()}] APP: exit keyword matched, session ended", flush=True)
-        end_session("Session ended. Thank you for contacting FoodHub!")
-        return
-    else:
         with st.spinner("Thinking..."):
             try:
-                reply = get_bot_response(st.session_state.cust_id, text, st.session_state.thread_id)
+                reply = get_bot_response(
+                    st.session_state.cust_id,
+                    text,
+                    st.session_state.thread_id,
+                )
             except Exception as e:
-                reply = "Sorry, something went wrong on our side. Please try again in a moment."
                 print(f"[{now_str()}] APP: get_bot_response raised {type(e).__name__}: {e}", flush=True)
+                reply = "Sorry, I could not complete that request because the AI service is temporarily unavailable. Please try again."
+
         add_message("assistant", reply)
         st.session_state.last_active = time.time()
         print(f"[{now_str()}] APP: bot replied, last_active reset", flush=True)
-
-    st.session_state.processing = False
-    st.session_state.awaiting_text = None
-
+    finally:
+        # Critical: a 429/503/timeout must never leave the UI permanently stuck.
+        st.session_state.processing = False
+        st.session_state.awaiting_text = None
+        st.session_state.call_in_progress = False
+        st.session_state.call_started_at = None
 
 def render_chat_history():
     for msg in st.session_state.messages:
@@ -223,25 +247,31 @@ if not st.session_state.session_active:
         with st.chat_message("assistant", avatar="🤖"):
             st.write(st.session_state.closing_message)
 else:
-    # Process one queued request at a time.
-    # IMPORTANT: there is deliberately NO stale-lock timeout. A slow but valid
-    # LLM call must be allowed to finish; declaring it stale was causing the
-    # same pending message to be executed again every few minutes.
-    if st.session_state.call_in_progress:
-        render_chat_history()
-        st.info("Still processing your last message, please wait...")
-        st.stop()
+    # Process a queued message exactly once. A real per-thread lock protects against
+    # concurrent Streamlit reruns/reconnects; there is deliberately NO stale-lock
+    # timeout, because declaring a slow request "stale" can duplicate the same order
+    # request while the original backend call is still running.
+    if st.session_state.processing:
+        thread_id = st.session_state.thread_id
+        call_lock = _get_call_lock(thread_id)
+        acquired = call_lock.acquire(blocking=False)
+        if not acquired:
+            print(f"[{now_str()}] APP: duplicate run blocked by active backend lock", flush=True)
+            if AUTOREFRESH_AVAILABLE:
+                st_autorefresh(interval=2000, key="wait_for_reply")
+            render_chat_history()
+            st.info("Still processing your last message, please wait...")
+            st.stop()
 
-    if st.session_state.processing and st.session_state.awaiting_text:
-        st.session_state.call_in_progress = True
-        st.session_state.call_started_at = time.time()
-        st.session_state.request_id = str(uuid.uuid4())
         try:
             process_pending_message()
         finally:
+            call_lock.release()
             st.session_state.call_in_progress = False
             st.session_state.call_started_at = None
-            st.session_state.request_id = None
+
+        # If process_pending_message completed (including a handled backend error),
+        # immediately render the settled state. Do not create another processing run.
         st.rerun()
 
     # Idle-timeout check (real periodic check if streamlit_autorefresh installed,
