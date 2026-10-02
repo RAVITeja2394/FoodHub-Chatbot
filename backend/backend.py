@@ -46,6 +46,18 @@ gemini_key = os.environ.get("GEMINI_TOKEN")
 if not gemini_key:
        raise ValueError("GEMINI_TOKEN environment variable is not set.")
 
+# ---------------------------------------------------------------------------
+# LOGGING HELPER
+# Prints with flush=True so lines show up immediately in Streamlit Cloud's
+# "Manage app" logs, and includes a timestamp so you can see how long each
+# step takes / where execution stalls.
+# ---------------------------------------------------------------------------
+import time as _time
+
+def log_step(label: str, extra: str = ""):
+    ts = _time.strftime("%H:%M:%S")
+    print(f"[{ts}] STEP: {label} {extra}", flush=True)
+
 # Resolve SQLite database file path dynamically for Google Colab (/content) or local execution
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # backend/ -> repo root
 DB_PATH = os.path.join(BASE_DIR, "data", "customer_orders.db")
@@ -103,6 +115,7 @@ def extract_text(content) -> str:
 def payment_failure_node(state: AgentState):
     """Deterministic response - payment-transaction problems are not verifiable
     from order records, so this always gives the same standard answer (no LLM call)."""
+    log_step("payment_failure_node: returning deterministic reply")
     return {"messages": [AIMessage(content=(
         "I'm sorry for the trouble — that's definitely frustrating. I've checked, "
         "and your payment has been verified as failed on our end. The deducted "
@@ -114,6 +127,7 @@ def payment_failure_node(state: AgentState):
 def escalation_agent(state: AgentState):
     """Deterministic handoff - raises a ticket rather than attempting to resolve
     subjective issues (taste, satisfaction) that need human judgment."""
+    log_step("escalation_agent: raising ticket")
     ticket_id = generate_ticket_id()
     return {"messages": [AIMessage(content=(
         f"Thank you for letting us know, and sorry this hasn't been resolved yet. "
@@ -127,6 +141,7 @@ def blocked_response_node(state: AgentState):
     """Handles both MALICIOUS and OUT_OF_SCOPE. Deliberately does NOT reveal which
     specific rule or pattern triggered the block, to avoid teaching a bad-faith
     user how to reword their way around the guardrail."""
+    log_step("blocked_response_node: category ->", state["category"])
     if state["category"] == "MALICIOUS":
         content = (
             "I'm not able to help with that request — it falls outside what I'm "
@@ -145,6 +160,7 @@ def blocked_response_node(state: AgentState):
 def clarify_node(state: AgentState):
     """NOT_CLEAR does not terminate the session - it asks a clarifying question and
     lets the conversation continue naturally on the next user message."""
+    log_step("clarify_node: asking clarifying question")
     return {"messages": [AIMessage(content=(
         "I want to make sure I help with the right thing — could you tell me a "
         "little more about what you need? For example, are you asking about an "
@@ -174,6 +190,7 @@ def refund_status_handler(state: AgentState):
     no dedicated refund_status column, we branch on order_status: a cancelled order
     gets a real, policy-backed answer; anything else (e.g. a quality dispute) needs
     human verification, so a ticket is raised instead of guessing."""
+    log_step("refund_status_handler: evaluating order_status")
     parsed = parse_sql_response(extract_text(state["messages"][-1].content))
     order_status = parsed.get("order_status")
 
@@ -193,7 +210,7 @@ def refund_status_handler(state: AgentState):
 def refund_eligibility_handler(state: AgentState):
     """Handles REFUND_ELIGIBILITY after the SQL loop finishes. Computes lateness
     against the 30-minute policy threshold using actual delivery_eta/delivery_time."""
-
+    log_step("refund_eligibility_handler: calculating lateness")
     parsed = parse_sql_response(extract_text(state["messages"][-1].content))
     delivery_eta = parsed.get("delivery_eta")
     delivery_time = parsed.get("delivery_time")
@@ -490,17 +507,19 @@ def router(state: AgentState):
     node to run. Never updates state itself — routing decisions and state
     updates are kept separate."""
     if state['category'] in ["STATUS", "REFUND_ELIGIBILITY", "REFUND_STATUS_CHECK"]:
-        return "sql_agent"
+        dest = "sql_agent"
     elif state['category'] == "POLICY":
-        return "rag_agent"
+        dest = "rag_agent"
     elif state['category'] == "PAYMENT_FAILURE":
-        return "payment_failure_node"
+        dest = "payment_failure_node"
     elif state['category'] == "ESCALATION":
-        return "escalation_agent"
+        dest = "escalation_agent"
     elif state['category'] in ["OUT_OF_SCOPE", "MALICIOUS"]:
-        return "blocked_response_node"
+        dest = "blocked_response_node"
     else:  # NOT_CLEAR
-        return "clarify_node"
+        dest = "clarify_node"
+    log_step("router: routing to ->", dest)
+    return dest
 
 
 def post_sql_route_fn(state: AgentState):
@@ -508,13 +527,13 @@ def post_sql_route_fn(state: AgentState):
 
     # Both of these categories deal with quality/disputes that need a ticket
     if category in ["REFUND_STATUS_CHECK", "ESCALATION"]:
-        return "refund_status_handler"
-
+        dest = "refund_status_handler"
     elif category == "REFUND_ELIGIBILITY":
-        return "refund_eligibility_handler"
-
+        dest = "refund_eligibility_handler"
     else:
-        return "end"
+        dest = "end"
+    log_step("post_sql_route_fn: routing to ->", dest)
+    return dest
 
 
 def passthrough(state: AgentState):
@@ -527,8 +546,10 @@ def classifier_node(state: AgentState):
     """The only node that reads the message with the classification system prompt.
     Writes to `category`/`frustration_level`, NOT `messages` — a routing label is
     not a conversational message and should not enter the chat history."""
+    log_step("classifier_node: calling classifier_model.invoke...")
     messages = [SystemMessage(content=Classifier_prompt)] + state['messages']
     result = classifier_model.invoke(messages)
+    log_step("classifier_node: done ->", f"category={result.category}, frustration={result.frustration_level}")
     return {"category": result.category, "frustration_level": result.frustration_level}
 
 def sql_node(state: AgentState):
@@ -536,8 +557,11 @@ def sql_node(state: AgentState):
     prompt. The {cust_id} placeholder is filled from the TRUSTED session value in
     state, never from anything the user typed — this is what prevents cross-customer
     access regardless of how the request is phrased."""
+    log_step("sql_node: calling SQL_model.invoke...")
     messages = [SystemMessage(content=SQL_AGENT_PROMPT.format(cust_id=state['cust_id']))] + state['messages']
     result = SQL_model.invoke(messages)
+    tool_calls = getattr(result, "tool_calls", None)
+    log_step("sql_node: done ->", f"tool_calls={len(tool_calls) if tool_calls else 0}")
     return {"messages": [result]}
 
 
@@ -549,6 +573,7 @@ def formatter_node(state: AgentState):
     matters because some field values are easy to misread out of context (e.g.
     payment_status='COD' means payment has NOT yet been collected, not that it
     has been received)."""
+    log_step("formatter_node: formatting SQL result into reply...")
     parsed = parse_sql_response(extract_text(state["messages"][-1].content))
 
     # Find the customer's most recent actual question, walking backward past
@@ -589,6 +614,7 @@ def formatter_node(state: AgentState):
         )
         content = extract_text(model.invoke(prompt).content)
 
+    log_step("formatter_node: done")
     return {"messages": [AIMessage(content=content)]}
 
 PDF_PATH = os.path.join(BASE_DIR, "data", "Food_Delivery_Policy_final.pdf")
@@ -600,22 +626,21 @@ def rag_node(state: AgentState):
     rather than risking an unsupported or hallucinated policy answer.
     Debug print statements are kept intentionally, to support the rubric's
     'comment on the agent workflow and accuracy' requirement with visible evidence."""
+    log_step("rag_node: retrieving from vector store...")
     question = extract_text(state['messages'][-1].content)
     docs = retriever.invoke(question)
     contexts = [d.page_content for d in docs]
+    log_step("rag_node: retrieved", f"{len(contexts)} chunks")
 
-    # print("RETRIEVED:", contexts)
-
+    log_step("rag_node: checking relevance...")
     relevance_result = check_relevance(question, contexts)
-
-    # print("RELEVANCE:", relevance_result.score)
-    # print("REL JUST:", relevance_result.justification)
-    # print("REL CONF:", relevance_result.confidence)
+    log_step("rag_node: relevance result ->", f"score={relevance_result.score}, confidence={relevance_result.confidence}")
 
     # 1. First safety guard: low relevance confidence -> raise a ticket, skip generation
     if relevance_result.confidence < 0.5:
         ticket_id = generate_ticket_id()
         content = f"I don't have that information. A service ticket ({ticket_id}) has been raised, and a human agent will follow up shortly."
+        log_step("rag_node: low relevance confidence, returning fallback ticket", ticket_id)
         return {"messages": [AIMessage(content=content)]}
 
     context_text = "\n".join(contexts)
@@ -626,36 +651,48 @@ def rag_node(state: AgentState):
         HumanMessage(content=question)
     ]
 
+    log_step("rag_node: generating answer from context...")
     result = model.invoke(messages)
     answer_text = extract_text(result.content)
+    log_step("rag_node: generated answer", answer_text[:80])
 
     # 2. Second safety guard: model explicitly signals context absence
     if "NOT_FOUND" in answer_text:
         ticket_id = generate_ticket_id()
         content = f"I don't have that information. A service ticket ({ticket_id}) has been raised, and a human agent will follow up shortly."
+        log_step("rag_node: model returned NOT_FOUND, returning fallback ticket", ticket_id)
         return {"messages": [AIMessage(content=content)]}
 
     # Run groundedness verification on the generated result
+    log_step("rag_node: checking groundedness...")
     grd_result = check_groundedness(question, contexts, answer_text)
-
-    # print("GROUNDEDNESS:", grd_result.score)
-    # print("GRD JUST:", grd_result.justification)
-    # print("GRD CONF:", grd_result.confidence)
+    log_step("rag_node: groundedness result ->", f"score={grd_result.score}, confidence={grd_result.confidence}")
 
     # 3. Third safety guard: low groundedness confidence -> possible hallucination
     if grd_result.confidence < 0.5:
         ticket_id = generate_ticket_id()
         content = f"I want to make sure you get accurate information. A service ticket ({ticket_id}) has been raised, and a human agent will follow up shortly."
+        log_step("rag_node: low groundedness confidence, returning fallback ticket", ticket_id)
         return {"messages": [AIMessage(content=content)]}
 
     # 4. Success path: return the clean, verified answer
+    log_step("rag_node: done, returning verified answer")
     return {"messages": [AIMessage(content=answer_text)]}
 
 workflow = StateGraph(AgentState)
 
 workflow.add_node("classifier_agent", classifier_node)
 workflow.add_node("sql_agent", sql_node)
-workflow.add_node("Toolkit", ToolNode(sql_tools))
+class LoggingToolNode(ToolNode):
+    """Thin wrapper around ToolNode that logs before/after running SQL tool
+    calls, so a stuck tool execution (e.g. a bad query hanging) is visible."""
+    def invoke(self, state, config=None, **kwargs):
+        log_step("Toolkit: executing tool call(s)...")
+        result = super().invoke(state, config=config, **kwargs)
+        log_step("Toolkit: tool call(s) finished")
+        return result
+
+workflow.add_node("Toolkit", LoggingToolNode(sql_tools))
 workflow.add_node("rag_agent", rag_node)
 workflow.add_node("payment_failure_node", payment_failure_node)
 workflow.add_node("escalation_agent", escalation_agent)
@@ -692,9 +729,20 @@ workflow.add_edge("refund_status_handler", END)
 app = workflow.compile(checkpointer=MemorySaver())
 
 def get_bot_response(cust_id: str, user_input: str, thread_id: str) -> str:
-       config, initial_state, _ = get_session_config(cust_id, thread_id=thread_id)
-       result = app.invoke(
-           {"messages": [HumanMessage(content=user_input)], **initial_state},
-           config=config,
-       )
-       return extract_text(result["messages"][-1].content)
+    log_step("get_bot_response: START", f"cust_id={cust_id}, thread_id={thread_id}, input={user_input[:60]!r}")
+    start_time = _time.time()
+    try:
+        config, initial_state, _ = get_session_config(cust_id, thread_id=thread_id)
+        config["recursion_limit"] = 15  # fail fast instead of looping silently forever
+        result = app.invoke(
+            {"messages": [HumanMessage(content=user_input)], **initial_state},
+            config=config,
+        )
+        reply = extract_text(result["messages"][-1].content)
+        elapsed = _time.time() - start_time
+        log_step("get_bot_response: DONE", f"elapsed={elapsed:.1f}s, reply={reply[:60]!r}")
+        return reply
+    except Exception as e:
+        elapsed = _time.time() - start_time
+        log_step("get_bot_response: ERROR", f"elapsed={elapsed:.1f}s, error={type(e).__name__}: {e}")
+        raise
