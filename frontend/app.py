@@ -29,7 +29,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 EXIT_KEYWORDS = {"exit", "quit", "thank you", "fine", "got it, thank you"}
 IDLE_TIMEOUT_SECONDS = 90
-CALL_LOCK_STALE_SECONDS = 360   # must exceed the worst-case request time (sum of per-model timeouts = 300s by default); older locks are assumed orphaned
 
 CUSTOMER_IDS = ["C1011", "C1012", "C1013", "C1014", "C1015"]
 
@@ -66,8 +65,9 @@ defaults = {
     "processing": False,
     "awaiting_text": None,
     "closing_message": None,
-    "call_in_progress": False,   # reentrancy lock: True while get_bot_response is running
+    "call_in_progress": False,   # reentrancy guard: True while get_bot_response is running
     "call_started_at": None,
+    "request_id": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -88,6 +88,7 @@ def start_session(cust_id: str):
     st.session_state.closing_message = None
     st.session_state.call_in_progress = False
     st.session_state.call_started_at = None
+    st.session_state.request_id = None
     st.session_state.processing = False
     st.session_state.awaiting_text = None
     if not st.session_state.greeted:
@@ -127,9 +128,7 @@ def queue_user_message(text: str):
 
 
 def process_pending_message():
-    """Phase 2 - runs on the follow-up rerun. st_autorefresh is NOT mounted
-    during this call (see main area below), so a slow backend call can no
-    longer be cancelled mid-flight by an autorefresh-triggered rerun."""
+    """Run the one pending backend request and always clear its state afterward."""
     text = st.session_state.awaiting_text
 
     if text.strip().lower() in EXIT_KEYWORDS:
@@ -224,38 +223,25 @@ if not st.session_state.session_active:
         with st.chat_message("assistant", avatar="🤖"):
             st.write(st.session_state.closing_message)
 else:
-    # If a message is queued from the previous rerun, process it now.
-    # IMPORTANT: st_autorefresh is intentionally NOT mounted during this branch,
-    # so a slow backend call can't be cancelled mid-flight by an autorefresh-
-    # triggered rerun (that was the bug causing replies to vanish).
-    # Hard reentrancy guard. Streamlit cannot cancel a script run that is blocked inside a
-    # long synchronous call, so a second overlapping run (autorefresh tick, websocket
-    # reconnect, ...) can start while the first is still waiting on the LLM. Without this
-    # lock both runs see processing=True and both call the backend for the same message.
+    # Process one queued request at a time.
+    # IMPORTANT: there is deliberately NO stale-lock timeout. A slow but valid
+    # LLM call must be allowed to finish; declaring it stale was causing the
+    # same pending message to be executed again every few minutes.
     if st.session_state.call_in_progress:
-        age = time.time() - (st.session_state.call_started_at or 0)
-        if age > CALL_LOCK_STALE_SECONDS:
-            print(f"[{now_str()}] APP: releasing stale call lock (age {age:.0f}s)", flush=True)
-            st.session_state.call_in_progress = False
-            st.session_state.call_started_at = None
-        else:
-            print(f"[{now_str()}] APP: duplicate run blocked by call lock", flush=True)
-            # Poll so the page picks up the reply once the in-flight call finishes
-            # (the blocked run's own st.rerun() may be discarded by Streamlit).
-            if AUTOREFRESH_AVAILABLE:
-                st_autorefresh(interval=2000, key="wait_for_reply")
-            render_chat_history()
-            st.info("Still processing your last message, please wait...")
-            st.stop()
+        render_chat_history()
+        st.info("Still processing your last message, please wait...")
+        st.stop()
 
-    if st.session_state.processing:
+    if st.session_state.processing and st.session_state.awaiting_text:
         st.session_state.call_in_progress = True
         st.session_state.call_started_at = time.time()
+        st.session_state.request_id = str(uuid.uuid4())
         try:
             process_pending_message()
         finally:
             st.session_state.call_in_progress = False
             st.session_state.call_started_at = None
+            st.session_state.request_id = None
         st.rerun()
 
     # Idle-timeout check (real periodic check if streamlit_autorefresh installed,
