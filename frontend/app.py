@@ -52,21 +52,66 @@ st.set_page_config(page_title="FoodHub ChatBot", page_icon="🍔", layout="wide"
 
 
 @st.cache_resource
-def _get_call_locks():
-    """Persistent per-process lock registry shared across Streamlit reruns.
+def _get_request_registry():
+    """Process-wide request registry.
 
-    Session-state booleans are not sufficient for concurrent Streamlit script runs: two
-    runs can read the same value before either one writes it. A real threading.Lock
-    prevents the same conversation from entering the backend twice.
+    Streamlit can have overlapping script runs with stale copies of session state.
+    A lock alone is not enough: a stale run can wake up after the first run finishes
+    and submit the same message again. The registry gives every queued message a
+    request_id and records its lifecycle so a request can execute at most once.
     """
-    return {}
+    return {"lock": threading.RLock(), "requests": {}}
 
 
-def _get_call_lock(thread_id):
-    locks = _get_call_locks()
-    if thread_id not in locks:
-        locks[thread_id] = threading.Lock()
-    return locks[thread_id]
+def _register_request(thread_id, request_id):
+    registry = _get_request_registry()
+    with registry["lock"]:
+        registry["requests"][thread_id] = {
+            "request_id": request_id,
+            "status": "queued",
+            "reply": None,
+            "delivered": False,
+        }
+
+
+def _claim_request(thread_id, request_id):
+    """Return queued/running/completed for this exact request.
+
+    Only the first run is allowed to transition queued -> running.
+    """
+    registry = _get_request_registry()
+    with registry["lock"]:
+        entry = registry["requests"].get(thread_id)
+        if not entry or entry["request_id"] != request_id:
+            return "missing", None
+        if entry["status"] == "queued":
+            entry["status"] = "running"
+            return "claimed", None
+        if entry["status"] == "completed":
+            return "completed", entry["reply"]
+        return "running", None
+
+
+def _complete_request(thread_id, request_id, reply):
+    registry = _get_request_registry()
+    with registry["lock"]:
+        entry = registry["requests"].get(thread_id)
+        if entry and entry["request_id"] == request_id:
+            entry["status"] = "completed"
+            entry["reply"] = reply
+
+
+def _deliver_request_once(thread_id, request_id):
+    """Atomically claim the completed reply so stale Streamlit runs cannot add it twice."""
+    registry = _get_request_registry()
+    with registry["lock"]:
+        entry = registry["requests"].get(thread_id)
+        if not entry or entry["request_id"] != request_id or entry["status"] != "completed":
+            return False, None
+        if entry["delivered"]:
+            return False, entry["reply"]
+        entry["delivered"] = True
+        return True, entry["reply"]
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +128,7 @@ defaults = {
     "pending_input": None,
     "processing": False,
     "awaiting_text": None,
+    "pending_request_id": None,
     "closing_message": None,
     "call_in_progress": False,   # reentrancy lock: True while get_bot_response is running
     "call_started_at": None,
@@ -108,6 +154,7 @@ def start_session(cust_id: str):
     st.session_state.call_started_at = None
     st.session_state.processing = False
     st.session_state.awaiting_text = None
+    st.session_state.pending_request_id = None
     if not st.session_state.greeted:
         st.balloons()
         st.session_state.greeted = True
@@ -142,37 +189,72 @@ def queue_user_message(text: str):
     print(f"[{now_str()}] APP: user message -> {text[:60]!r}", flush=True)
     st.session_state.processing = True
     st.session_state.awaiting_text = text
+    request_id = str(uuid.uuid4())
+    st.session_state.pending_request_id = request_id
+    _register_request(st.session_state.thread_id, request_id)
 
 
 def process_pending_message():
-    """Execute the pending request and ALWAYS settle frontend state, even on errors."""
+    """Execute one request, with process-wide idempotency across Streamlit reruns."""
+    thread_id = st.session_state.thread_id
+    request_id = st.session_state.pending_request_id
     text = st.session_state.awaiting_text
-    try:
-        if text and text.strip().lower() in EXIT_KEYWORDS:
-            print(f"[{now_str()}] APP: exit keyword matched, session ended", flush=True)
-            end_session("Session ended. Thank you for contacting FoodHub!")
-            return
 
-        with st.spinner("Thinking..."):
-            try:
-                reply = get_bot_response(
-                    st.session_state.cust_id,
-                    text,
-                    st.session_state.thread_id,
-                )
-            except Exception as e:
-                print(f"[{now_str()}] APP: get_bot_response raised {type(e).__name__}: {e}", flush=True)
-                reply = "Sorry, I could not complete that request because the AI service is temporarily unavailable. Please try again."
+    status, cached_reply = _claim_request(thread_id, request_id)
 
-        add_message("assistant", reply)
-        st.session_state.last_active = time.time()
-        print(f"[{now_str()}] APP: bot replied, last_active reset", flush=True)
-    finally:
-        # Critical: a 429/503/timeout must never leave the UI permanently stuck.
+    if status == "running":
+        print(f"[{now_str()}] APP: duplicate run blocked by active backend request", flush=True)
+        if AUTOREFRESH_AVAILABLE:
+            st_autorefresh(interval=2000, key=f"wait_for_reply_{request_id}")
+        return False
+
+    if status == "completed":
+        claimed, reply = _deliver_request_once(thread_id, request_id)
+        if claimed:
+            add_message("assistant", reply)
+            st.session_state.last_active = time.time()
+            print(f"[{now_str()}] APP: delivered cached backend reply", flush=True)
         st.session_state.processing = False
         st.session_state.awaiting_text = None
-        st.session_state.call_in_progress = False
-        st.session_state.call_started_at = None
+        st.session_state.pending_request_id = None
+        return True
+
+    if status != "claimed":
+        # The session may have been cleared/restarted. Never submit an unknown
+        # stale request to the backend.
+        st.session_state.processing = False
+        st.session_state.awaiting_text = None
+        st.session_state.pending_request_id = None
+        return True
+
+    try:
+        if text and text.strip().lower() in EXIT_KEYWORDS:
+            reply = "Session ended. Thank you for contacting FoodHub!"
+            end_session(reply)
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    reply = get_bot_response(
+                        st.session_state.cust_id,
+                        text,
+                        thread_id,
+                    )
+                except Exception as e:
+                    print(f"[{now_str()}] APP: get_bot_response raised {type(e).__name__}: {e}", flush=True)
+                    reply = "Sorry, I could not complete that request because the AI service is temporarily unavailable. Please try again."
+
+            _complete_request(thread_id, request_id, reply)
+            claimed, delivered_reply = _deliver_request_once(thread_id, request_id)
+            if claimed:
+                add_message("assistant", delivered_reply)
+                st.session_state.last_active = time.time()
+                print(f"[{now_str()}] APP: bot replied, last_active reset", flush=True)
+    finally:
+        st.session_state.processing = False
+        st.session_state.awaiting_text = None
+        st.session_state.pending_request_id = None
+
+    return True
 
 def render_chat_history():
     for msg in st.session_state.messages:
@@ -223,6 +305,7 @@ with st.sidebar:
                 st.session_state.thread_id = str(uuid.uuid4())  # new thread so the backend forgets the old chat
                 st.session_state.processing = False
                 st.session_state.awaiting_text = None
+                st.session_state.pending_request_id = None
                 st.session_state.last_active = time.time()
                 st.rerun()
         with col_b:
@@ -247,31 +330,14 @@ if not st.session_state.session_active:
         with st.chat_message("assistant", avatar="🤖"):
             st.write(st.session_state.closing_message)
 else:
-    # Process a queued message exactly once. A real per-thread lock protects against
-    # concurrent Streamlit reruns/reconnects; there is deliberately NO stale-lock
-    # timeout, because declaring a slow request "stale" can duplicate the same order
-    # request while the original backend call is still running.
+    # Process a queued message exactly once. The request registry, rather than
+    # session_state alone, is authoritative across overlapping Streamlit runs.
     if st.session_state.processing:
-        thread_id = st.session_state.thread_id
-        call_lock = _get_call_lock(thread_id)
-        acquired = call_lock.acquire(blocking=False)
-        if not acquired:
-            print(f"[{now_str()}] APP: duplicate run blocked by active backend lock", flush=True)
-            if AUTOREFRESH_AVAILABLE:
-                st_autorefresh(interval=2000, key="wait_for_reply")
+        completed = process_pending_message()
+        if not completed:
             render_chat_history()
             st.info("Still processing your last message, please wait...")
             st.stop()
-
-        try:
-            process_pending_message()
-        finally:
-            call_lock.release()
-            st.session_state.call_in_progress = False
-            st.session_state.call_started_at = None
-
-        # If process_pending_message completed (including a handled backend error),
-        # immediately render the settled state. Do not create another processing run.
         st.rerun()
 
     # Idle-timeout check (real periodic check if streamlit_autorefresh installed,
