@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 
 import sqlite3
+from datetime import datetime
 import uuid
 import os
 import pandas as pd
@@ -68,12 +69,43 @@ DB_PATH = os.path.join(BASE_DIR, "data", "customer_orders.db")
 db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
 
-model = init_chat_model(
-    model="gemini-3.5-flash-lite",
-    model_provider='google_genai',
-    api_key=gemini_key,
-    temperature=0,
-)
+# ---------------------------------------------------------------------------
+# MODEL CHAIN WITH FALLBACK
+# The first model is the primary; if a call to it raises (429 quota, 5xx, timeout,
+# structured-output parse failure...), LangChain automatically retries the SAME call on
+# the next model in the chain. The same GEMINI_TOKEN works for every Gemini model.
+# Override without code changes:  GEMINI_MODEL_CHAIN="modelA,modelB,modelC"
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL_CHAIN = "gemini-3.5-flash-lite,gemini-2.5-flash-lite,gemini-2.5-pro"
+
+
+def parse_model_chain(value) -> list:
+    """'a, b ,,c' -> ['a','b','c'] (order preserved, blanks and duplicates dropped)."""
+    names = []
+    for part in (value or "").split(","):
+        part = part.strip()
+        if part and part not in names:
+            names.append(part)
+    return names
+
+
+def build_with_fallbacks(models: list, transform=None):
+    """Applies `transform` (e.g. with_structured_output / bind_tools) to EVERY model in the
+    chain, then returns primary.with_fallbacks([...rest]). With a single model it just
+    returns that model's runnable unchanged."""
+    runnables = [transform(m) if transform else m for m in models]
+    if len(runnables) == 1:
+        return runnables[0]
+    return runnables[0].with_fallbacks(runnables[1:])
+
+
+MODEL_CHAIN = parse_model_chain(os.environ.get("GEMINI_MODEL_CHAIN", DEFAULT_MODEL_CHAIN)) or parse_model_chain(DEFAULT_MODEL_CHAIN)
+models = [
+    init_chat_model(model=name, model_provider='google_genai', api_key=gemini_key, temperature=0)
+    for name in MODEL_CHAIN
+]
+model = models[0]                                   # primary (used to build the SQL toolkit)
+resilient_model = build_with_fallbacks(models)      # plain text generation with fallback
 
 # Shared state — every node in the graph reads from and writes to this schema.
 class AgentState(TypedDict):
@@ -192,9 +224,9 @@ def refund_status_handler(state: AgentState):
     human verification, so a ticket is raised instead of guessing."""
     log_step("refund_status_handler: evaluating order_status")
     parsed = parse_sql_response(extract_text(state["messages"][-1].content))
-    order_status = parsed.get("order_status")
+    order_status = (parsed.get("order_status") or "").strip().lower()
 
-    if order_status == "canceled":
+    if order_status in ("canceled", "cancelled"):
         content = "Your order was cancelled, and the refund is being processed to your FoodHub Wallet within 7–10 business days."
     else:
         ticket_id = generate_ticket_id()
@@ -207,26 +239,45 @@ def refund_status_handler(state: AgentState):
     return {"messages": [AIMessage(content=content)]}
 
 
+_TIME_FORMATS = ("%H:%M", "%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S")
+
+
+def _parse_clock_time(value):
+    """Parses a delivery time string into a datetime, or returns None if it is
+    missing / 'None' / 'NULL' / not a recognisable clock time (e.g. a bare '15')."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value or value.lower() in ("none", "null", "nan", "n/a"):
+        return None
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def refund_eligibility_handler(state: AgentState):
     """Handles REFUND_ELIGIBILITY after the SQL loop finishes. Computes lateness
-    against the 30-minute policy threshold using actual delivery_eta/delivery_time."""
+    against the 30-minute policy threshold using actual delivery_eta/delivery_time.
+    Missing, 'None' or unparseable timing data falls back to a ticket instead of crashing."""
     log_step("refund_eligibility_handler: calculating lateness")
     parsed = parse_sql_response(extract_text(state["messages"][-1].content))
-    delivery_eta = parsed.get("delivery_eta")
-    delivery_time = parsed.get("delivery_time")
+    eta = _parse_clock_time(parsed.get("delivery_eta"))
+    actual = _parse_clock_time(parsed.get("delivery_time"))
 
-    # 1. Fallback if data is missing
-    if not delivery_eta or not delivery_time:
+    # 1. Fallback if data is missing or unreadable
+    if eta is None or actual is None:
         ticket_id = generate_ticket_id()
         content = (f"I don't have enough delivery timing data to confirm refund "
                    f"eligibility for this order. A service ticket ({ticket_id}) "
                    f"has been raised for manual review.")
     else:
-        # 2. Calculate delay
-        from datetime import datetime
-        eta = datetime.strptime(delivery_eta, "%H:%M")
-        actual = datetime.strptime(delivery_time, "%H:%M")
+        # 2. Calculate delay (handle deliveries that cross midnight, e.g. ETA 23:50, actual 00:30)
         late_minutes = (actual - eta).total_seconds() / 60
+        if late_minutes < -12 * 60:
+            late_minutes += 24 * 60
 
         # 3. Apply business logic
         if late_minutes > 30:
@@ -314,10 +365,10 @@ that judgment."""
     result = groundedness_judge.invoke(prompt)
     return result
 
-classifier_model = model.with_structured_output(ClassifierSchema, method="json_schema")
-SQL_model = model.bind_tools(sql_tools)
-relevance_judge = model.with_structured_output(RelevanceScore)
-groundedness_judge = model.with_structured_output(GroundednessScore)
+classifier_model = build_with_fallbacks(models, lambda m: m.with_structured_output(ClassifierSchema, method="json_schema"))
+SQL_model = build_with_fallbacks(models, lambda m: m.bind_tools(sql_tools))
+relevance_judge = build_with_fallbacks(models, lambda m: m.with_structured_output(RelevanceScore))
+groundedness_judge = build_with_fallbacks(models, lambda m: m.with_structured_output(GroundednessScore))
 
 
 Classifier_prompt = """
@@ -466,7 +517,7 @@ RESTRICTIONS:
 
 OUTPUT FORMAT:
 Return the requested values as labeled key:value pairs, comma-separated
-(e.g. "order_id: 1042, order_status: out_for_delivery, delivery_eta: 15").
+(e.g. "order_id: 1042, order_status: out_for_delivery, delivery_eta: 14:30").
 Do not add greetings, explanations, or commentary - your output is consumed by
 another system component, not shown directly to the customer.
 
@@ -612,7 +663,7 @@ def formatter_node(state: AgentState):
             f"Customer's question: {question}\n"
             f"Raw data: {raw_response}"
         )
-        content = extract_text(model.invoke(prompt).content)
+        content = extract_text(resilient_model.invoke(prompt).content)
 
     log_step("formatter_node: done")
     return {"messages": [AIMessage(content=content)]}
@@ -631,6 +682,8 @@ def rag_node(state: AgentState):
     docs = retriever.invoke(question)
     contexts = [d.page_content for d in docs]
     log_step("rag_node: retrieved", f"{len(contexts)} chunks")
+    for i, c in enumerate(contexts):
+        log_step(f"rag_node: chunk[{i}]", repr(c[:100]))
 
     log_step("rag_node: checking relevance...")
     relevance_result = check_relevance(question, contexts)
@@ -652,7 +705,7 @@ def rag_node(state: AgentState):
     ]
 
     log_step("rag_node: generating answer from context...")
-    result = model.invoke(messages)
+    result = resilient_model.invoke(messages)
     answer_text = extract_text(result.content)
     log_step("rag_node: generated answer", answer_text[:80])
 
@@ -699,6 +752,7 @@ workflow.add_node("escalation_agent", escalation_agent)
 workflow.add_node("blocked_response_node", blocked_response_node)
 workflow.add_node("clarify_node", clarify_node)
 workflow.add_node("refund_status_handler", refund_status_handler)
+workflow.add_node("refund_eligibility_handler", refund_eligibility_handler)
 workflow.add_node("formatter_node", formatter_node)
 workflow.add_node("post_sql_router", passthrough)
 
@@ -721,10 +775,12 @@ workflow.add_edge("Toolkit", "sql_agent")
 # everything else (STATUS/REFUND_ELIGIBILITY) goes through the formatter
 workflow.add_conditional_edges("post_sql_router", post_sql_route_fn, path_map={
     "refund_status_handler": "refund_status_handler",
+    "refund_eligibility_handler": "refund_eligibility_handler",
     "end": "formatter_node"
 })
 workflow.add_edge("formatter_node", END)
 workflow.add_edge("refund_status_handler", END)
+workflow.add_edge("refund_eligibility_handler", END)
 
 app = workflow.compile(checkpointer=MemorySaver())
 
