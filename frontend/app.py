@@ -29,7 +29,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 EXIT_KEYWORDS = {"exit", "quit", "thank you", "fine", "got it, thank you"}
 IDLE_TIMEOUT_SECONDS = 90
-CALL_LOCK_STALE_SECONDS = 180   # a lock older than this is assumed orphaned and is released
+CALL_LOCK_STALE_SECONDS = 360   # must exceed the worst-case request time (sum of per-model timeouts = 300s by default); older locks are assumed orphaned
 
 CUSTOMER_IDS = ["C1011", "C1012", "C1013", "C1014", "C1015"]
 
