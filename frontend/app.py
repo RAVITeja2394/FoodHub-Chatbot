@@ -29,6 +29,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 EXIT_KEYWORDS = {"exit", "quit", "thank you", "fine", "got it, thank you"}
 IDLE_TIMEOUT_SECONDS = 90
+CALL_LOCK_STALE_SECONDS = 180   # a lock older than this is assumed orphaned and is released
 
 CUSTOMER_IDS = ["C1011", "C1012", "C1013", "C1014", "C1015"]
 
@@ -64,6 +65,9 @@ defaults = {
     "pending_input": None,
     "processing": False,
     "awaiting_text": None,
+    "closing_message": None,
+    "call_in_progress": False,   # reentrancy lock: True while get_bot_response is running
+    "call_started_at": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -81,16 +85,26 @@ def start_session(cust_id: str):
     st.session_state.first_message_sent = False
     st.session_state.messages = [{"role": "assistant", "content": WELCOME_MSG, "time": now_str()}]
     st.session_state.last_active = time.time()
+    st.session_state.closing_message = None
+    st.session_state.call_in_progress = False
+    st.session_state.call_started_at = None
+    st.session_state.processing = False
+    st.session_state.awaiting_text = None
     if not st.session_state.greeted:
         st.balloons()
         st.session_state.greeted = True
 
 
-def end_session():
+def end_session(message: str = "Have a nice day!!"):
     st.session_state.session_active = False
     st.session_state.cust_id = None
     st.session_state.thread_id = None
-    st.session_state.messages = [{"role": "assistant", "content": "Have a nice day!!", "time": now_str()}]
+    st.session_state.processing = False
+    st.session_state.awaiting_text = None
+    st.session_state.pending_input = None
+    # Shown on the landing page (the inactive view doesn't render chat history)
+    st.session_state.closing_message = message
+    st.session_state.messages = [{"role": "assistant", "content": message, "time": now_str()}]
     st.session_state.first_message_sent = False
     st.session_state.last_active = None
     st.session_state.greeted = False
@@ -119,15 +133,15 @@ def process_pending_message():
     text = st.session_state.awaiting_text
 
     if text.strip().lower() in EXIT_KEYWORDS:
-        add_message("assistant", "Session ended. Thank you for contacting FoodHub!")
-        st.session_state.session_active = False
         print(f"[{now_str()}] APP: exit keyword matched, session ended", flush=True)
+        end_session("Session ended. Thank you for contacting FoodHub!")
+        return
     else:
         with st.spinner("Thinking..."):
             try:
                 reply = get_bot_response(st.session_state.cust_id, text, st.session_state.thread_id)
             except Exception as e:
-                reply = f"Sorry, something went wrong: {e}"
+                reply = "Sorry, something went wrong on our side. Please try again in a moment."
                 print(f"[{now_str()}] APP: get_bot_response raised {type(e).__name__}: {e}", flush=True)
         add_message("assistant", reply)
         st.session_state.last_active = time.time()
@@ -135,6 +149,18 @@ def process_pending_message():
 
     st.session_state.processing = False
     st.session_state.awaiting_text = None
+
+
+def render_chat_history():
+    for msg in st.session_state.messages:
+        avatar = "🧑" if msg["role"] == "user" else "🤖"
+        with st.chat_message(msg["role"], avatar=avatar):
+            st.write(msg["content"])
+            st.caption(msg["time"])
+            if msg["role"] == "assistant" and msg["content"] != WELCOME_MSG:
+                fb1, fb2, _ = st.columns([1, 1, 10])
+                fb1.button("👍", key=f"up_{id(msg)}")
+                fb2.button("👎", key=f"down_{id(msg)}")
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +197,9 @@ with st.sidebar:
             if st.button("🔄 Clear chat", use_container_width=True):
                 st.session_state.messages = [{"role": "assistant", "content": WELCOME_MSG, "time": now_str()}]
                 st.session_state.first_message_sent = False
+                st.session_state.thread_id = str(uuid.uuid4())  # new thread so the backend forgets the old chat
+                st.session_state.processing = False
+                st.session_state.awaiting_text = None
                 st.session_state.last_active = time.time()
                 st.rerun()
         with col_b:
@@ -191,13 +220,42 @@ if not st.session_state.session_active:
         """,
         unsafe_allow_html=True,
     )
+    if st.session_state.closing_message:
+        with st.chat_message("assistant", avatar="🤖"):
+            st.write(st.session_state.closing_message)
 else:
     # If a message is queued from the previous rerun, process it now.
     # IMPORTANT: st_autorefresh is intentionally NOT mounted during this branch,
     # so a slow backend call can't be cancelled mid-flight by an autorefresh-
     # triggered rerun (that was the bug causing replies to vanish).
+    # Hard reentrancy guard. Streamlit cannot cancel a script run that is blocked inside a
+    # long synchronous call, so a second overlapping run (autorefresh tick, websocket
+    # reconnect, ...) can start while the first is still waiting on the LLM. Without this
+    # lock both runs see processing=True and both call the backend for the same message.
+    if st.session_state.call_in_progress:
+        age = time.time() - (st.session_state.call_started_at or 0)
+        if age > CALL_LOCK_STALE_SECONDS:
+            print(f"[{now_str()}] APP: releasing stale call lock (age {age:.0f}s)", flush=True)
+            st.session_state.call_in_progress = False
+            st.session_state.call_started_at = None
+        else:
+            print(f"[{now_str()}] APP: duplicate run blocked by call lock", flush=True)
+            # Poll so the page picks up the reply once the in-flight call finishes
+            # (the blocked run's own st.rerun() may be discarded by Streamlit).
+            if AUTOREFRESH_AVAILABLE:
+                st_autorefresh(interval=2000, key="wait_for_reply")
+            render_chat_history()
+            st.info("Still processing your last message, please wait...")
+            st.stop()
+
     if st.session_state.processing:
-        process_pending_message()
+        st.session_state.call_in_progress = True
+        st.session_state.call_started_at = time.time()
+        try:
+            process_pending_message()
+        finally:
+            st.session_state.call_in_progress = False
+            st.session_state.call_started_at = None
         st.rerun()
 
     # Idle-timeout check (real periodic check if streamlit_autorefresh installed,
@@ -207,8 +265,9 @@ else:
         st_autorefresh(interval=5000, key="idle_check")
 
     if st.session_state.last_active and (time.time() - st.session_state.last_active > IDLE_TIMEOUT_SECONDS):
-        end_session()
-        st.info(f"Session ended after {IDLE_TIMEOUT_SECONDS}s of inactivity.")
+        idle_msg = f"Session ended after {IDLE_TIMEOUT_SECONDS}s of inactivity."
+        end_session(idle_msg)
+        st.info(idle_msg)
         st.stop()
 
     # Banner
@@ -229,16 +288,7 @@ else:
             end_session()
             st.rerun()
 
-    # Chat history
-    for msg in st.session_state.messages:
-        avatar = "🧑" if msg["role"] == "user" else "🤖"
-        with st.chat_message(msg["role"], avatar=avatar):
-            st.write(msg["content"])
-            st.caption(msg["time"])
-            if msg["role"] == "assistant" and msg["content"] != WELCOME_MSG:
-                fb1, fb2, _ = st.columns([1, 1, 10])
-                fb1.button("👍", key=f"up_{id(msg)}")
-                fb2.button("👎", key=f"down_{id(msg)}")
+    render_chat_history()
 
     # Centered quick questions - only shown before the first user message
     if not st.session_state.first_message_sent:
