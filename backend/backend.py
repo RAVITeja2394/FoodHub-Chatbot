@@ -1,5 +1,6 @@
 # --- Core LangChain / LangGraph imports ---
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END               # graph construction primitives
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader                # loads the policy PDF for RAG
 import pymupdf
@@ -28,6 +29,7 @@ import pandas as pd
 import numpy as np
 from random import randint
 import logging
+import re
 
 # Schema Validation
 from pydantic import BaseModel, Field
@@ -46,6 +48,7 @@ os.environ["PYMUPDF_MESSAGE"] = ""    # To supress OCR messages in Retreiver
 
 
 gemini_key = os.environ.get("GEMINI_TOKEN")
+groq_key = os.environ.get("GROQ_API_KEY")
 if not gemini_key:
        raise ValueError("GEMINI_TOKEN environment variable is not set.")
 
@@ -79,17 +82,11 @@ db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 # 4. gemini-2.5-pro: Highly accurate baseline reasoning.
 # 5. gemini-2.5-flash: Resilient baseline production model.
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL_CHAIN = (
-    # Current Gemini API model IDs. Keep only models that are valid for the
-    # current API; retired/non-existent IDs must not consume fallback time.
-    "gemini-3.8-flash,"
-    "gemini-3.7-flash,"
-    "gemini-3.6-flash,"
-    "gemini-3.5-flash-lite,"
-    "gemini-3.1-flash-lite,"
-    "gemini-3.1-pro-preview"
+DEFAULT_GEMINI_MODEL_CHAIN = (
+    # Keep Gemini short: the logs showed the middle models timing out repeatedly.
+    "gemini-3.8-flash,gemini-3.5-flash-lite"
 )
-
+DEFAULT_GROQ_MODEL_CHAIN = "openai/gpt-oss-20b"
 
 def parse_model_chain(value) -> list:
     """'a, b ,,c' -> ['a','b','c'] (order preserved, blanks and duplicates dropped)."""
@@ -100,135 +97,88 @@ def parse_model_chain(value) -> list:
             names.append(part)
     return names
 
-
 def _is_timeout_error(exc: Exception) -> bool:
-    """Return True only for transport/model timeout failures.
-
-    We intentionally do NOT treat 429, 503, quota, or generic provider errors as
-    timeouts: those should move directly to the next model.
-    """
     name = type(exc).__name__.lower()
     text = str(exc).lower()
-    timeout_names = {
-        "readtimeout", "connecttimeout", "writetimeout", "pooltimeout",
-        "timeouterror", "timeout",
-    }
-    if name in timeout_names or "readtimeout" in name or "time out" in text or "timed out" in text:
-        return True
-    return False
-
+    timeout_names = {"readtimeout", "connecttimeout", "writetimeout", "pooltimeout", "timeouterror", "timeout"}
+    return name in timeout_names or "readtimeout" in name or "time out" in text or "timed out" in text or "deadline_exceeded" in text
 
 def _short_error(exc: Exception) -> str:
-    text = str(exc).replace("\n", " ")
-    return text[:300]
+    return str(exc).replace("\n", " ")[:300]
 
-
-def build_with_fallbacks(models: list, transform=None):
-    """Build a reliable sequential model fallback runnable.
-
-    Rules:
-      * Normal slowness: wait until that model's configured timeout.
-      * Timeout: retry the SAME model exactly once.
-      * Second timeout: move to the next model.
-      * 429/quota, 503/unavailable, model-not-found, and other provider failures:
-        move to the next model immediately (no extra retry).
-
-    This explicit wrapper is used instead of Runnable.with_fallbacks because the
-    Gemini/partner exception can be wrapped by the provider integration in a way
-    that does not reliably trigger the fallback handler.
-    """
-    runnables = [transform(m) if transform else m for m in models]
-
+def build_with_fallbacks(entries):
+    """Sequential provider fallback. Timeout -> retry same entry once; other provider errors -> next entry."""
     def invoke_with_fallbacks(input_value, config=None, **kwargs):
         last_error = None
-        for index, runnable in enumerate(runnables):
-            model_name = MODEL_CHAIN[index] if index < len(MODEL_CHAIN) else f"model-{index+1}"
-            attempts = 2
-            for attempt in range(1, attempts + 1):
+        for index, (label, runnable) in enumerate(entries):
+            for attempt in (1, 2):
                 try:
-                    if attempt > 1:
-                        log_step("model fallback: retrying same model", f"{model_name} (attempt {attempt}/2)")
-                    else:
-                        log_step("model fallback: trying", f"{model_name}")
+                    log_step("model fallback: trying", f"{label}" if attempt == 1 else f"{label} (retry {attempt}/2)")
                     return runnable.invoke(input_value, config=config, **kwargs)
                 except Exception as exc:
                     last_error = exc
-                    is_timeout = _is_timeout_error(exc)
-                    if is_timeout and attempt == 1:
-                        log_step("model fallback: timeout", f"{model_name}; retrying same model once")
+                    if _is_timeout_error(exc) and attempt == 1:
+                        log_step("model fallback: timeout", f"{label}; retrying same model once")
                         continue
-                    log_step(
-                        "model fallback: failed",
-                        f"{model_name}; type={type(exc).__name__}; {_short_error(exc)}"
-                    )
+                    log_step("model fallback: failed", f"{label}; type={type(exc).__name__}; {_short_error(exc)}")
                     break
         if last_error is not None:
             raise last_error
         raise RuntimeError("No models configured in fallback chain")
-
     return RunnableLambda(invoke_with_fallbacks)
 
-
-# ---------------------------------------------------------------------------
-# PER-MODEL TIMEOUTS (seconds)
-# Pro models "think" before answering, so they get a longer window than flash/lite.
-# A model that is not listed here uses DEFAULT_TIMEOUT_SECONDS.
-# Override without code changes:  GEMINI_MODEL_TIMEOUTS="gemini-3.1-pro=120,gemini-2.5-flash=40"
-# ---------------------------------------------------------------------------
-DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_TIMEOUT_SECONDS = 45
 DEFAULT_MODEL_TIMEOUTS = {
     "gemini-3.8-flash": 45,
-    "gemini-3.1-pro": 90,
     "gemini-3.5-flash-lite": 30,
-    "gemini-2.5-pro": 90,
-    "gemini-2.5-flash": 45,
+    "openai/gpt-oss-20b": 30,
 }
 
-
 def parse_model_timeouts(value) -> dict:
-    """'a=30, b=90' -> {'a': 30.0, 'b': 90.0}. Malformed, non-numeric or non-positive
-    entries are ignored (so a typo in the env var can never disable a timeout)."""
     result = {}
     for part in (value or "").split(","):
         if "=" not in part:
             continue
         name, _, secs = part.partition("=")
-        name = name.strip()
         try:
             secs = float(secs.strip())
         except ValueError:
             continue
-        if name and secs > 0:
-            result[name] = secs
+        if name.strip() and secs > 0:
+            result[name.strip()] = secs
     return result
 
-
-MODEL_TIMEOUTS = {**DEFAULT_MODEL_TIMEOUTS, **parse_model_timeouts(os.environ.get("GEMINI_MODEL_TIMEOUTS"))}
-
+MODEL_TIMEOUTS = {**DEFAULT_MODEL_TIMEOUTS, **parse_model_timeouts(os.environ.get("MODEL_TIMEOUTS"))}
 
 def get_model_timeout(name: str):
-    """Timeout in seconds for one model; DEFAULT_TIMEOUT_SECONDS if it isn't in the table."""
     return MODEL_TIMEOUTS.get(name, DEFAULT_TIMEOUT_SECONDS)
 
+gemini_names = parse_model_chain(os.environ.get("GEMINI_MODEL_CHAIN", DEFAULT_GEMINI_MODEL_CHAIN))
+groq_names = parse_model_chain(os.environ.get("GROQ_MODEL_CHAIN", DEFAULT_GROQ_MODEL_CHAIN))
 
-MODEL_CHAIN = parse_model_chain(os.environ.get("GEMINI_MODEL_CHAIN", DEFAULT_MODEL_CHAIN)) or parse_model_chain(DEFAULT_MODEL_CHAIN)
+model_entries = []
+for name in gemini_names:
+    model_entries.append((f"gemini:{name}", init_chat_model(
+        model=name, model_provider="google_genai", api_key=gemini_key,
+        temperature=0, max_retries=0, timeout=get_model_timeout(name),
+    )))
 
-# Using 'google_genai' partner package initialization syntax
-models = [
-    init_chat_model(
-        model=name,
-        model_provider='google_genai',
-        api_key=gemini_key,
-        temperature=0,
-        max_retries=0,                    # <--- CRITICAL ADDITION: fail over immediately instead of retrying the same model
-        timeout=get_model_timeout(name),  # <--- per-model timeout (see MODEL_TIMEOUTS above)
-    )
-    for name in MODEL_CHAIN
-]
-log_step("model chain ->", ", ".join(f"{n}({get_model_timeout(n):g}s)" for n in MODEL_CHAIN))
+if groq_key:
+    for name in groq_names:
+        model_entries.append((f"groq:{name}", ChatGroq(
+            model=name, api_key=groq_key, temperature=0, max_retries=0,
+            timeout=get_model_timeout(name),
+        )))
+else:
+    log_step("model chain warning ->", "GROQ_API_KEY is not set; Groq fallback disabled")
 
-model = models[0]                                   # Primary: gemini-3.8-flash (built for SQL/agents)
-resilient_model = build_with_fallbacks(models)      # Fallback chain for generic generation
+if not model_entries:
+    raise ValueError("No chat models are configured.")
+
+log_step("model chain ->", ", ".join(f"{label}({get_model_timeout(label.split(':',1)[-1]):g}s)" for label, _ in model_entries))
+models = [m for _, m in model_entries]
+model = models[0]
+resilient_model = build_with_fallbacks(model_entries)
 
 # Shared state — every node in the graph reads from and writes to this schema.
 class AgentState(TypedDict):
@@ -417,8 +367,12 @@ def refund_eligibility_handler(state: AgentState):
     return {"messages": [AIMessage(content=content)]}
 
 sql_toolkit = SQLDatabaseToolkit(db=db, llm=model)
-
 sql_tools = sql_toolkit.get_tools()
+# Only expose the query tool to the SQL model. Schema/list/checker tools were
+# allowing the agent to enter multi-step tool loops for simple order lookups.
+sql_query_tool = next((t for t in sql_tools if getattr(t, "name", "") == "sql_db_query"), None)
+if sql_query_tool is None:
+    raise RuntimeError("sql_db_query tool is unavailable in SQLDatabaseToolkit")
 
 # Forces the classifier's output into exactly these two fields, each from a fixed
 # set of allowed values — never free text the rest of the graph would have to parse.
@@ -547,8 +501,10 @@ that judgment."""
     result = groundedness_judge.invoke(prompt)
     return result
 
-classifier_model = build_with_fallbacks(models, lambda m: m.with_structured_output(ClassifierSchema, method="json_schema"))
-SQL_model = build_with_fallbacks(models, lambda m: m.bind_tools(sql_tools))
+classifier_entries = [(label, m.with_structured_output(ClassifierSchema, method="json_schema")) for (label, m) in model_entries]
+classifier_model = build_with_fallbacks(classifier_entries)
+SQL_entries = [(label, m.bind_tools([sql_query_tool])) for (label, m) in model_entries]
+SQL_model = build_with_fallbacks(SQL_entries)
 relevance_judge = build_with_fallbacks(models, lambda m: m.with_structured_output(RelevanceScore))
 groundedness_judge = build_with_fallbacks(models, lambda m: m.with_structured_output(GroundednessScore))
 
@@ -785,69 +741,95 @@ def classifier_node(state: AgentState):
     log_step("classifier_node: done ->", f"category={result.category}, frustration={result.frustration_level}")
     return {"category": result.category, "frustration_level": result.frustration_level}
 
+def _safe_customer_query(query: str, cust_id: str) -> str:
+    """Execute exactly one read-only customer-scoped SELECT and return key:value pairs."""
+    q = (query or "").strip()
+    q_low = q.lower()
+    if not re.match(r"^select\b", q_low) or ";" in q or "--" in q or "/*" in q_low or "*/" in q_low:
+        return "QUERY_ERROR"
+    if not re.search(r"\bfrom\s+orders\b", q_low):
+        return "QUERY_ERROR"
+    # Require the trusted customer id to be present in the generated WHERE clause.
+    escaped = re.escape(str(cust_id))
+    if not re.search(rf"\bcustomer_id\s*=\s*['\"]?{escaped}['\"]?", q, flags=re.IGNORECASE):
+        return "QUERY_ERROR"
+    forbidden = r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma)\b"
+    if re.search(forbidden, q_low):
+        return "QUERY_ERROR"
+
+    try:
+        uri = f"file:{DB_PATH}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            cur = conn.cursor()
+            cur.execute(q)
+            rows = cur.fetchall()
+            columns = [d[0] for d in cur.description or []]
+    except Exception as exc:
+        log_step("sql_node: database query failed", _short_error(exc))
+        return "QUERY_ERROR"
+
+    if not rows:
+        return "NOT_FOUND"
+
+    # The prompt asks the model to use LIMIT 1 for latest/single-order requests.
+    # If it returns multiple rows, use the first row rather than starting another LLM turn.
+    row = rows[0]
+    return ", ".join(f"{col}: {val}" for col, val in zip(columns, row))
+
 def sql_node(state: AgentState):
-    """Calls the SQL-generating model with the mandatory customer-scoping system
-    prompt. The {cust_id} placeholder is filled from the TRUSTED session value in
-    state, never from anything the user typed — this is what prevents cross-customer
-    access regardless of how the request is phrased."""
+    """One LLM decision + one SQL execution. Never loops back into the LLM."""
     log_step("sql_node: calling SQL_model.invoke...")
     messages = [SystemMessage(content=SQL_AGENT_PROMPT.format(cust_id=state['cust_id']))] + state['messages']
     result = SQL_model.invoke(messages)
-    tool_calls = getattr(result, "tool_calls", None)
-    log_step("sql_node: done ->", f"tool_calls={len(tool_calls) if tool_calls else 0}")
-    return {"messages": [result]}
+    tool_calls = getattr(result, "tool_calls", None) or []
+    log_step("sql_node: done ->", f"tool_calls={len(tool_calls)}")
 
+    if not tool_calls:
+        text = extract_text(getattr(result, "content", ""))
+        return {"messages": [AIMessage(content=text or "QUERY_ERROR")]}
+
+    # Hard cap: exactly one database call per customer request.
+    call = tool_calls[0]
+    args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
+    query = args.get("query") if isinstance(args, dict) else None
+    if not query:
+        return {"messages": [AIMessage(content="QUERY_ERROR")]}
+
+    if len(tool_calls) > 1:
+        log_step("sql_node: multiple tool calls requested", "executing only the first")
+
+    log_step("sql_node: executing one customer-scoped SELECT")
+    sql_result = _safe_customer_query(query, state["cust_id"])
+    log_step("sql_node: database result ->", sql_result[:160])
+    return {"messages": [AIMessage(content=sql_result)]}
 
 def formatter_node(state: AgentState):
-    """Converts the SQL agent's raw 'key: value' machine-readable output into a
-    short, conversational customer-facing reply using an LLM call. Passes the
-    customer's original question alongside the raw data so the reply actually
-    answers what was asked, rather than just restating fields verbatim - this
-    matters because some field values are easy to misread out of context (e.g.
-    payment_status='COD' means payment has NOT yet been collected, not that it
-    has been received)."""
-    log_step("formatter_node: formatting SQL result into reply...")
+    """Deterministic formatter: no additional LLM call after the SQL lookup."""
+    log_step("formatter_node: deterministic formatting...")
     parsed = parse_sql_response(extract_text(state["messages"][-1].content))
-
-    # Find the customer's most recent actual question, walking backward past
-    # the SQL agent's tool-calling exchange (AIMessage/ToolMessage pairs)
-    question = ""
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, HumanMessage):
-            question = extract_text(msg.content)
-            break
-
-    if not parsed:
-        content = "I couldn't find details for that order."
+    if not parsed or "QUERY_ERROR" in parsed:
+        content = "I couldn't retrieve your order details right now. Please try again."
+    elif "NOT_FOUND" in parsed:
+        content = "I couldn't find an order for your account."
     else:
-        raw_response = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in parsed.items())
-        prompt = (
-            "Rewrite the following raw order data into a short, warm, conversational "
-            "customer support reply that directly answers the customer's question below "
-            "- like a live chat message, not a formal letter. Do not include greetings "
-            "like 'Dear Customer', sign-offs like 'Sincerely', or any letter formatting. "
-            "Just 1-2 natural sentences.\n\n"
-            "IMPORTANT interpretation notes:\n"
-            "- payment_status='COD' means Cash on Delivery: payment has NOT yet been "
-            "collected, it will be collected when the order is delivered. Never phrase "
-            "COD as if payment has already been received.\n"
-            "- A field value of 'None' or empty means that stage hasn't happened yet "
-            "(e.g. delivery_time=None means not yet delivered) - phrase this naturally, "
-            "don't say 'None'.\n"
-            "- If delivery_eta or delivery_time is missing/None, this means the order has "
-            "not been dispatched yet - say something like 'it hasn't been dispatched yet' "
-            "or 'no delivery estimate is available yet'. NEVER say 'on the way', 'out for "
-            "delivery', or any other delivery-in-progress phrase unless order_status "
-            "explicitly says so.\n"
-            "- Always describe the SAME order_status value consistently, using the exact "
-            "status category found in the data (e.g. 'preparing food' stays 'being "
-            "prepared', never rephrased into a different status like 'on the way').\n\n"
-            f"Customer's question: {question}\n"
-            f"Raw data: {raw_response}"
-        )
-        content = extract_text(resilient_model.invoke(prompt).content)
-
-    log_step("formatter_node: done")
+        status = str(parsed.get("order_status", "")).strip()
+        eta = str(parsed.get("delivery_eta", "")).strip()
+        delivered = str(parsed.get("delivery_time", "")).strip()
+        order_id = str(parsed.get("order_id", "")).strip()
+        payment = str(parsed.get("payment_status", "")).strip()
+        parts = []
+        if status:
+            parts.append(f"Your order{(' #' + order_id) if order_id else ''} is currently {status}.")
+        if eta and eta.lower() not in ("none", "null", "nan", ""):
+            parts.append(f"The delivery estimate is {eta}.")
+        elif delivered and delivered.lower() not in ("none", "null", "nan", ""):
+            parts.append(f"It was delivered at {delivered}.")
+        if payment and payment.upper() == "COD":
+            parts.append("Payment is Cash on Delivery and will be collected when the order is delivered.")
+        elif payment:
+            parts.append(f"Payment status: {payment}.")
+        content = " ".join(parts) if parts else "I found your order, but there are no status details available yet."
+    log_step("formatter_node: done (no LLM call)")
     return {"messages": [AIMessage(content=content)]}
 
 PDF_PATH = os.path.join(BASE_DIR, "data", "Food_Delivery_Policy_final.pdf")
@@ -918,16 +900,6 @@ workflow = StateGraph(AgentState)
 
 workflow.add_node("classifier_agent", classifier_node)
 workflow.add_node("sql_agent", sql_node)
-class LoggingToolNode(ToolNode):
-    """Thin wrapper around ToolNode that logs before/after running SQL tool
-    calls, so a stuck tool execution (e.g. a bad query hanging) is visible."""
-    def invoke(self, state, config=None, **kwargs):
-        log_step("Toolkit: executing tool call(s)...")
-        result = super().invoke(state, config=config, **kwargs)
-        log_step("Toolkit: tool call(s) finished")
-        return result
-
-workflow.add_node("Toolkit", LoggingToolNode(sql_tools))
 workflow.add_node("rag_agent", rag_node)
 workflow.add_node("payment_failure_node", payment_failure_node)
 workflow.add_node("escalation_agent", escalation_agent)
@@ -949,9 +921,9 @@ workflow.add_edge("blocked_response_node", END)
 workflow.add_edge("clarify_node", END)
 workflow.add_edge("rag_agent", END)
 
-# sql_agent loops with its tool node (Toolkit) until it has no more tool calls to make
-workflow.add_conditional_edges("sql_agent", tools_condition, path_map={"tools": "Toolkit", END: "post_sql_router"})
-workflow.add_edge("Toolkit", "sql_agent")
+# SQL path is intentionally single-pass: sql_agent performs one model decision and
+# one database query, then goes directly to the deterministic post-SQL router.
+workflow.add_edge("sql_agent", "post_sql_router")
 
 # After the SQL loop exits: REFUND_STATUS_CHECK needs special handling,
 # everything else (STATUS/REFUND_ELIGIBILITY) goes through the formatter
