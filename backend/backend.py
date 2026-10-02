@@ -80,11 +80,14 @@ db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 # 5. gemini-2.5-flash: Resilient baseline production model.
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL_CHAIN = (
+    # Current Gemini API model IDs. Keep only models that are valid for the
+    # current API; retired/non-existent IDs must not consume fallback time.
     "gemini-3.8-flash,"
-    "gemini-3.1-pro,"
+    "gemini-3.7-flash,"
+    "gemini-3.6-flash,"
     "gemini-3.5-flash-lite,"
-    "gemini-2.5-pro,"
-    "gemini-2.5-flash"
+    "gemini-3.1-flash-lite,"
+    "gemini-3.1-pro-preview"
 )
 
 
@@ -140,7 +143,7 @@ def build_with_fallbacks(models: list, transform=None):
         last_error = None
         for index, runnable in enumerate(runnables):
             model_name = MODEL_CHAIN[index] if index < len(MODEL_CHAIN) else f"model-{index+1}"
-            attempts = 2 if True else 1
+            attempts = 2
             for attempt in range(1, attempts + 1):
                 try:
                     if attempt > 1:
