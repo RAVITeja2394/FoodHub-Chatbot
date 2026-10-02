@@ -181,11 +181,15 @@ model = models[0]
 resilient_model = build_with_fallbacks(model_entries)
 
 # Shared state — every node in the graph reads from and writes to this schema.
-class AgentState(TypedDict):
-    messages: Annotated[List, add_messages]  # conversation history (auto-appended via add_messages reducer)
-    cust_id: str                              # trusted customer identity, set once at session start
-    category: str                             # classifier's routing label (drives which node runs next)
-    frustration_level: str                    # classifier's tone assessment (HIGH/MEDIUM/LOW)
+class AgentState(TypedDict, total=False):
+    messages: Annotated[List, add_messages]
+    cust_id: str
+    category: str
+    frustration_level: str
+    result_source: str       # SQL, RAG, REFUND, SYSTEM
+    result_data: object      # structured/raw result consumed only by formatter
+    rag_context: str         # retrieved policy context for the final formatter
+
 
 def get_session_config(cust_id: str, thread_id: str = None):
     """Builds the LangGraph config + initial state for one customer session.
@@ -291,82 +295,65 @@ def parse_sql_response(sql_response: str) -> dict:
 
 
 def refund_status_handler(state: AgentState):
-    """Handles REFUND_STATUS_CHECK after the SQL loop finishes. Since the schema has
-    no dedicated refund_status column, we branch on order_status: a cancelled order
-    gets a real, policy-backed answer; anything else (e.g. a quality dispute) needs
-    human verification, so a ticket is raised instead of guessing."""
-    log_step("refund_status_handler: evaluating order_status")
-    parsed = parse_sql_response(extract_text(state["messages"][-1].content))
+    """Convert the SQL result into structured facts; the shared formatter produces the final reply."""
+    log_step("refund_status_handler: evaluating SQL result")
+    raw = extract_text(state.get("result_data", ""))
+    parsed = parse_sql_response(raw)
     order_status = (parsed.get("order_status") or "").strip().lower()
 
     if order_status in ("canceled", "cancelled"):
-        content = "Your order was cancelled, and the refund is being processed to your FoodHub Wallet within 7–10 business days."
+        result = {
+            "type": "refund_status",
+            "order_status": order_status,
+            "refund_status": "processing",
+            "refund_timeline": "7–10 business days",
+            "message_basis": "The order was cancelled; the refund is processed to the FoodHub Wallet within 7–10 business days."
+        }
+    elif raw == "NOT_FOUND":
+        result = {"type": "not_found", "message_basis": "No matching order was found for the authenticated customer."}
     else:
         ticket_id = generate_ticket_id()
-        content = (
-            f"Refund requests related to order quality need to be reviewed by our team. "
-            f"A service ticket ({ticket_id}) has been raised, and we'll follow up once "
-            f"your claim has been verified."
-        )
-
-    return {"messages": [AIMessage(content=content)]}
-
-
-_TIME_FORMATS = ("%H:%M", "%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S")
-
-
-def _parse_clock_time(value):
-    """Parses a delivery time string into a datetime, or returns None if it is
-    missing / 'None' / 'NULL' / not a recognisable clock time (e.g. a bare '15')."""
-    if value is None:
-        return None
-    value = str(value).strip()
-    if not value or value.lower() in ("none", "null", "nan", "n/a"):
-        return None
-    for fmt in _TIME_FORMATS:
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return None
+        result = {
+            "type": "manual_review",
+            "ticket_id": ticket_id,
+            "message_basis": "The refund request needs human verification rather than an unsupported guess."
+        }
+    return {"result_source": "REFUND", "result_data": result}
 
 
 def refund_eligibility_handler(state: AgentState):
-    """Handles REFUND_ELIGIBILITY after the SQL loop finishes. Computes lateness
-    against the 30-minute policy threshold using actual delivery_eta/delivery_time.
-    Missing, 'None' or unparseable timing data falls back to a ticket instead of crashing."""
-    log_step("refund_eligibility_handler: calculating lateness")
-    parsed = parse_sql_response(extract_text(state["messages"][-1].content))
+    """Calculate refund eligibility from trusted SQL values; shared formatter gives the customer-facing answer."""
+    log_step("refund_eligibility_handler: calculating eligibility")
+    raw = extract_text(state.get("result_data", ""))
+    parsed = parse_sql_response(raw)
     eta = _parse_clock_time(parsed.get("delivery_eta"))
     actual = _parse_clock_time(parsed.get("delivery_time"))
 
-    # 1. Fallback if data is missing or unreadable
-    if eta is None or actual is None:
+    if raw == "NOT_FOUND":
+        result = {"type": "not_found", "message_basis": "No matching order was found for the authenticated customer."}
+    elif eta is None or actual is None:
         ticket_id = generate_ticket_id()
-        content = (f"I don't have enough delivery timing data to confirm refund "
-                   f"eligibility for this order. A service ticket ({ticket_id}) "
-                   f"has been raised for manual review.")
+        result = {
+            "type": "manual_review",
+            "ticket_id": ticket_id,
+            "message_basis": "Delivery timing data is missing or unreadable, so eligibility cannot be confirmed safely."
+        }
     else:
-        # 2. Calculate delay (handle deliveries that cross midnight, e.g. ETA 23:50, actual 00:30)
         late_minutes = (actual - eta).total_seconds() / 60
         if late_minutes < -12 * 60:
             late_minutes += 24 * 60
+        result = {
+            "type": "refund_eligibility",
+            "delivery_eta": parsed.get("delivery_eta"),
+            "delivery_time": parsed.get("delivery_time"),
+            "delay_minutes": round(late_minutes, 2),
+            "eligible_for_late_delivery_refund": late_minutes > 30,
+            "refund_percentage": 25 if late_minutes > 30 else 0,
+            "policy_threshold_minutes": 30,
+            "message_basis": "Late-delivery eligibility is based on actual delivery time minus delivery ETA; more than 30 minutes qualifies for the 25% refund."
+        }
+    return {"result_source": "REFUND", "result_data": result}
 
-        # 3. Apply business logic
-        if late_minutes > 30:
-            content = ("Your order was delivered more than 30 minutes past the "
-                       "estimated time, so you're eligible for a 25% refund, which "
-                       "has been automatically credited to your FoodHub Wallet.")
-        else:
-            content = ("Order is eligible for refund if it is late by more than 30 minutes, "
-                       "has quality issues, or receives a wrong item. As I checked your order, "
-                       "it is not late so you are not eligible for a refund based on timing. "
-                       "However, let me know if you have any quality issues or if a wrong item "
-                       "was delivered.")
-
-    return {"messages": [AIMessage(content=content)]}
-
-sql_toolkit = SQLDatabaseToolkit(db=db, llm=model)
 sql_tools = sql_toolkit.get_tools()
 # Only expose the query tool to the SQL model. Schema/list/checker tools were
 # allowing the agent to enter multi-step tool loops for simple order lookups.
@@ -692,9 +679,6 @@ CUSTOMER QUESTION:
 {question}
 """
 def router(state: AgentState):
-    """Conditional-edge function: reads state and returns the NAME of the next
-    node to run. Never updates state itself — routing decisions and state
-    updates are kept separate."""
     if state['category'] in ["STATUS", "REFUND_ELIGIBILITY", "REFUND_STATUS_CHECK"]:
         dest = "sql_agent"
     elif state['category'] == "POLICY":
@@ -705,7 +689,7 @@ def router(state: AgentState):
         dest = "escalation_agent"
     elif state['category'] in ["OUT_OF_SCOPE", "MALICIOUS"]:
         dest = "blocked_response_node"
-    else:  # NOT_CLEAR
+    else:
         dest = "clarify_node"
     log_step("router: routing to ->", dest)
     return dest
@@ -713,50 +697,45 @@ def router(state: AgentState):
 
 def post_sql_route_fn(state: AgentState):
     category = state["category"]
-
-    # Both of these categories deal with quality/disputes that need a ticket
-    if category in ["REFUND_STATUS_CHECK", "ESCALATION"]:
-        dest = "refund_status_handler"
-    elif category == "REFUND_ELIGIBILITY":
-        dest = "refund_eligibility_handler"
-    else:
-        dest = "end"
-    log_step("post_sql_route_fn: routing to ->", dest)
-    return dest
+    if category == "REFUND_STATUS_CHECK":
+        return "refund_status_handler"
+    if category == "REFUND_ELIGIBILITY":
+        return "refund_eligibility_handler"
+    return "formatter_node"
 
 
 def passthrough(state: AgentState):
-    """No-op node — exists only to give the post-SQL conditional router a real
-    node to attach to, since LangGraph conditional edges require a source node."""
     return {}
 
 
+def _latest_user_question(state: AgentState) -> str:
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            return extract_text(msg.content)
+    return ""
+
+
 def classifier_node(state: AgentState):
-    """The only node that reads the message with the classification system prompt.
-    Writes to `category`/`frustration_level`, NOT `messages` — a routing label is
-    not a conversational message and should not enter the chat history."""
     log_step("classifier_node: calling classifier_model.invoke...")
     messages = [SystemMessage(content=Classifier_prompt)] + state['messages']
     result = classifier_model.invoke(messages)
     log_step("classifier_node: done ->", f"category={result.category}, frustration={result.frustration_level}")
     return {"category": result.category, "frustration_level": result.frustration_level}
 
+
 def _safe_customer_query(query: str, cust_id: str) -> str:
-    """Execute exactly one read-only customer-scoped SELECT and return key:value pairs."""
+    """Execute exactly one read-only SELECT scoped to the authenticated customer."""
     q = (query or "").strip()
     q_low = q.lower()
     if not re.match(r"^select\b", q_low) or ";" in q or "--" in q or "/*" in q_low or "*/" in q_low:
         return "QUERY_ERROR"
     if not re.search(r"\bfrom\s+orders\b", q_low):
         return "QUERY_ERROR"
-    # Require the trusted customer id to be present in the generated WHERE clause.
     escaped = re.escape(str(cust_id))
-    if not re.search(rf"\bcustomer_id\s*=\s*['\"]?{escaped}['\"]?", q, flags=re.IGNORECASE):
+    if not re.search(rf"\bcustomer_id\s*=\s*[\x22\x27]?{escaped}[\x22\x27]?", q, flags=re.IGNORECASE):
         return "QUERY_ERROR"
-    forbidden = r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma)\b"
-    if re.search(forbidden, q_low):
+    if re.search(r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma)\b", q_low):
         return "QUERY_ERROR"
-
     try:
         uri = f"file:{DB_PATH}?mode=ro"
         with sqlite3.connect(uri, uri=True) as conn:
@@ -767,17 +746,18 @@ def _safe_customer_query(query: str, cust_id: str) -> str:
     except Exception as exc:
         log_step("sql_node: database query failed", _short_error(exc))
         return "QUERY_ERROR"
-
     if not rows:
         return "NOT_FOUND"
+    # One DB execution only. Keep all returned rows so the formatter can handle
+    # list-style questions (e.g. recent orders) without another SQL call.
+    return "\n".join(
+        ", ".join(f"{col}: {val}" for col, val in zip(columns, row))
+        for row in rows
+    )
 
-    # The prompt asks the model to use LIMIT 1 for latest/single-order requests.
-    # If it returns multiple rows, use the first row rather than starting another LLM turn.
-    row = rows[0]
-    return ", ".join(f"{col}: {val}" for col, val in zip(columns, row))
 
 def sql_node(state: AgentState):
-    """One LLM decision + one SQL execution. Never loops back into the LLM."""
+    """One SQL-generation LLM call, followed by one customer-scoped DB execution. No tool loop."""
     log_step("sql_node: calling SQL_model.invoke...")
     messages = [SystemMessage(content=SQL_AGENT_PROMPT.format(cust_id=state['cust_id']))] + state['messages']
     result = SQL_model.invoke(messages)
@@ -785,116 +765,131 @@ def sql_node(state: AgentState):
     log_step("sql_node: done ->", f"tool_calls={len(tool_calls)}")
 
     if not tool_calls:
-        text = extract_text(getattr(result, "content", ""))
-        return {"messages": [AIMessage(content=text or "QUERY_ERROR")]}
+        text = extract_text(getattr(result, "content", "")) or "QUERY_ERROR"
+        return {"result_source": "SQL", "result_data": text}
 
-    # Hard cap: exactly one database call per customer request.
     call = tool_calls[0]
     args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
     query = args.get("query") if isinstance(args, dict) else None
     if not query:
-        return {"messages": [AIMessage(content="QUERY_ERROR")]}
-
+        return {"result_source": "SQL", "result_data": "QUERY_ERROR"}
     if len(tool_calls) > 1:
         log_step("sql_node: multiple tool calls requested", "executing only the first")
 
     log_step("sql_node: executing one customer-scoped SELECT")
     sql_result = _safe_customer_query(query, state["cust_id"])
-    log_step("sql_node: database result ->", sql_result[:160])
-    return {"messages": [AIMessage(content=sql_result)]}
-
-def formatter_node(state: AgentState):
-    """Deterministic formatter: no additional LLM call after the SQL lookup."""
-    log_step("formatter_node: deterministic formatting...")
-    parsed = parse_sql_response(extract_text(state["messages"][-1].content))
-    if not parsed or "QUERY_ERROR" in parsed:
-        content = "I couldn't retrieve your order details right now. Please try again."
-    elif "NOT_FOUND" in parsed:
-        content = "I couldn't find an order for your account."
-    else:
-        status = str(parsed.get("order_status", "")).strip()
-        eta = str(parsed.get("delivery_eta", "")).strip()
-        delivered = str(parsed.get("delivery_time", "")).strip()
-        order_id = str(parsed.get("order_id", "")).strip()
-        payment = str(parsed.get("payment_status", "")).strip()
-        parts = []
-        if status:
-            parts.append(f"Your order{(' #' + order_id) if order_id else ''} is currently {status}.")
-        if eta and eta.lower() not in ("none", "null", "nan", ""):
-            parts.append(f"The delivery estimate is {eta}.")
-        elif delivered and delivered.lower() not in ("none", "null", "nan", ""):
-            parts.append(f"It was delivered at {delivered}.")
-        if payment and payment.upper() == "COD":
-            parts.append("Payment is Cash on Delivery and will be collected when the order is delivered.")
-        elif payment:
-            parts.append(f"Payment status: {payment}.")
-        content = " ".join(parts) if parts else "I found your order, but there are no status details available yet."
-    log_step("formatter_node: done (no LLM call)")
-    return {"messages": [AIMessage(content=content)]}
+    log_step("sql_node: database result ->", sql_result[:200])
+    return {"result_source": "SQL", "result_data": sql_result}
 
 PDF_PATH = os.path.join(BASE_DIR, "data", "Food_Delivery_Policy_final.pdf")
 retriever = get_retreiver(PDF_PATH)
 
 def rag_node(state: AgentState):
-    """Full RAG pipeline: retrieve -> check relevance -> generate -> check
-    groundedness. Falls back to a ticket-raising response if either check fails,
-    rather than risking an unsupported or hallucinated policy answer.
-    Debug print statements are kept intentionally, to support the rubric's
-    'comment on the agent workflow and accuracy' requirement with visible evidence."""
+    """Retrieve and verify relevance only. The shared final formatter performs the single customer-facing generation."""
     log_step("rag_node: retrieving from vector store...")
-    question = extract_text(state['messages'][-1].content)
+    question = _latest_user_question(state)
     docs = retriever.invoke(question)
     contexts = [d.page_content for d in docs]
     log_step("rag_node: retrieved", f"{len(contexts)} chunks")
-    for i, c in enumerate(contexts):
-        log_step(f"rag_node: chunk[{i}]", repr(c[:100]))
+
+    if not contexts:
+        ticket_id = generate_ticket_id()
+        return {"result_source": "SYSTEM", "result_data": {"type": "manual_review", "ticket_id": ticket_id, "message_basis": "No policy information was retrieved."}}
 
     log_step("rag_node: checking relevance...")
     relevance_result = check_relevance(question, contexts)
     log_step("rag_node: relevance result ->", f"score={relevance_result.score}, confidence={relevance_result.confidence}")
-
-    # 1. First safety guard: low relevance confidence -> raise a ticket, skip generation
-    if relevance_result.confidence < 0.5:
+    if relevance_result.score != "RELEVANT" or relevance_result.confidence < 0.5:
         ticket_id = generate_ticket_id()
-        content = f"I don't have that information. A service ticket ({ticket_id}) has been raised, and a human agent will follow up shortly."
-        log_step("rag_node: low relevance confidence, returning fallback ticket", ticket_id)
-        return {"messages": [AIMessage(content=content)]}
+        return {"result_source": "SYSTEM", "result_data": {"type": "manual_review", "ticket_id": ticket_id, "message_basis": "The available policy information was not sufficiently relevant to answer safely."}}
 
-    context_text = "\n".join(contexts)
+    return {
+        "result_source": "RAG",
+        "result_data": {"question": question, "context": "\n\n".join(contexts)}
+    }
 
-    # Pass both the system prompt instructions and the user's question as a turn
-    messages = [
-        SystemMessage(content=RAG_PROMPT.format(context=context_text, question=question)),
-        HumanMessage(content=question)
-    ]
 
-    log_step("rag_node: generating answer from context...")
-    result = resilient_model.invoke(messages)
-    answer_text = extract_text(result.content)
-    log_step("rag_node: generated answer", answer_text[:80])
+def formatter_node(state: AgentState):
+    """Single shared final LLM formatter for SQL, RAG and refund-agent results."""
+    source = state.get("result_source", "SYSTEM")
+    data = state.get("result_data", "")
+    question = _latest_user_question(state)
+    log_step("formatter_node: generating final customer response", f"source={source}")
 
-    # 2. Second safety guard: model explicitly signals context absence
-    if "NOT_FOUND" in answer_text:
-        ticket_id = generate_ticket_id()
-        content = f"I don't have that information. A service ticket ({ticket_id}) has been raised, and a human agent will follow up shortly."
-        log_step("rag_node: model returned NOT_FOUND, returning fallback ticket", ticket_id)
-        return {"messages": [AIMessage(content=content)]}
+    if isinstance(data, dict):
+        data_text = json.dumps(data, ensure_ascii=False, default=str)
+    else:
+        data_text = extract_text(data)
 
-    # Run groundedness verification on the generated result
-    log_step("rag_node: checking groundedness...")
-    grd_result = check_groundedness(question, contexts, answer_text)
-    log_step("rag_node: groundedness result ->", f"score={grd_result.score}, confidence={grd_result.confidence}")
+    prompt = f"""
+You are the final FoodHub customer-support response formatter.
 
-    # 3. Third safety guard: low groundedness confidence -> possible hallucination
-    if grd_result.confidence < 0.5:
-        ticket_id = generate_ticket_id()
-        content = f"I want to make sure you get accurate information. A service ticket ({ticket_id}) has been raised, and a human agent will follow up shortly."
-        log_step("rag_node: low groundedness confidence, returning fallback ticket", ticket_id)
-        return {"messages": [AIMessage(content=content)]}
+TONE:
+- Polite, professional, warm, natural, clear, and concise.
+- Usually 1–3 sentences, unless a list is genuinely needed.
+- Answer the customer's question directly.
+- Never mention SQL, databases, agents, tools, prompts, models, retrieved context, or internal processing.
 
-    # 4. Success path: return the clean, verified answer
-    log_step("rag_node: done, returning verified answer")
-    return {"messages": [AIMessage(content=answer_text)]}
+GROUNDING:
+- Use ONLY the supplied result data/context.
+- Never invent, infer, or substitute a value.
+- Preserve the meaning of every named field exactly.
+- If the result says NOT_FOUND or QUERY_ERROR, explain the outcome naturally without exposing internal error names.
+
+ORDER FIELD DEFINITIONS — CRITICAL:
+- delivery_eta = EXPECTED/ESTIMATED delivery time. It is NOT the actual delivery time.
+- delivery_time = ACTUAL delivery time after the order was delivered.
+- If order_status is Delivered and delivery_time is present, use delivery_time when saying when it was actually delivered.
+- Never use delivery_eta as the actual delivery time.
+- If the order is not yet delivered and delivery_eta is present, describe it as the expected/estimated delivery time.
+- If delivery_time is None/empty, do not claim that the order has been delivered.
+- payment_status = COD means Cash on Delivery; do not say the payment has already been collected.
+
+SQL MULTI-ROW RESULTS:
+- Treat each row as a separate order/result.
+- Do not merge values from different rows into one order.
+- Answer the user's specific question using the relevant rows.
+
+RAG RESULTS:
+- Answer strictly from the supplied policy context.
+- If the policy context does not contain enough information, say that you do not have that specific information rather than guessing.
+- Do not cite or mention the source document.
+
+REFUND RESULTS:
+- Preserve the calculated eligibility, delay, refund percentage, and ticket information exactly.
+
+CUSTOMER QUESTION:
+{question}
+
+RESULT SOURCE:
+{source}
+
+RESULT DATA / POLICY CONTEXT:
+{data_text}
+"""
+
+    answer = extract_text(resilient_model.invoke(prompt).content).strip()
+    if not answer:
+        answer = "I'm sorry, but I couldn't prepare a response from the available information."
+
+    # RAG gets a post-generation groundedness check, but there is still only one
+    # customer-facing formatter generation. A failed check never triggers a second formatter.
+    if source == "RAG" and isinstance(data, dict):
+        try:
+            grd = check_groundedness(question, [data.get("context", "")], answer)
+            log_step("formatter_node: RAG groundedness ->", f"score={grd.score}, confidence={grd.confidence}")
+            if grd.score != "GROUNDED" or grd.confidence < 0.5:
+                ticket_id = generate_ticket_id()
+                answer = f"I want to make sure you receive accurate information. I've raised a service ticket ({ticket_id}) for review."
+        except Exception as exc:
+            # A failed safety judge must never re-run the formatter or expose a
+            # provider error to the customer; fail closed with a manual-review ticket.
+            log_step("formatter_node: groundedness check failed", _short_error(exc))
+            ticket_id = generate_ticket_id()
+            answer = f"I want to make sure you receive accurate information. I've raised a service ticket ({ticket_id}) for review."
+
+    log_step("formatter_node: done")
+    return {"messages": [AIMessage(content=answer)]}
 
 workflow = StateGraph(AgentState)
 
@@ -911,30 +906,24 @@ workflow.add_node("formatter_node", formatter_node)
 workflow.add_node("post_sql_router", passthrough)
 
 workflow.add_edge(START, "classifier_agent")
-
-# Every message is classified first; router() sends it to the right specialist node
 workflow.add_conditional_edges("classifier_agent", router)
 
+# Deterministic paths can terminate directly; SQL/RAG/refund paths always use the
+# one shared final formatter immediately before the customer response.
 workflow.add_edge("payment_failure_node", END)
 workflow.add_edge("escalation_agent", END)
 workflow.add_edge("blocked_response_node", END)
 workflow.add_edge("clarify_node", END)
-workflow.add_edge("rag_agent", END)
-
-# SQL path is intentionally single-pass: sql_agent performs one model decision and
-# one database query, then goes directly to the deterministic post-SQL router.
 workflow.add_edge("sql_agent", "post_sql_router")
-
-# After the SQL loop exits: REFUND_STATUS_CHECK needs special handling,
-# everything else (STATUS/REFUND_ELIGIBILITY) goes through the formatter
 workflow.add_conditional_edges("post_sql_router", post_sql_route_fn, path_map={
     "refund_status_handler": "refund_status_handler",
     "refund_eligibility_handler": "refund_eligibility_handler",
-    "end": "formatter_node"
+    "formatter_node": "formatter_node",
 })
+workflow.add_edge("refund_status_handler", "formatter_node")
+workflow.add_edge("refund_eligibility_handler", "formatter_node")
+workflow.add_edge("rag_agent", "formatter_node")
 workflow.add_edge("formatter_node", END)
-workflow.add_edge("refund_status_handler", END)
-workflow.add_edge("refund_eligibility_handler", END)
 
 app = workflow.compile(checkpointer=MemorySaver())
 
