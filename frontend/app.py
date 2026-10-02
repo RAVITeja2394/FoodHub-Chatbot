@@ -102,18 +102,22 @@ def handle_user_message(text: str):
     st.session_state.last_active = time.time()
     st.session_state.first_message_sent = True
     add_message("user", text)
+    print(f"[{now_str()}] APP: user message -> {text[:60]!r}", flush=True)
 
     if text.strip().lower() in EXIT_KEYWORDS:
         add_message("assistant", "Session ended. Thank you for contacting FoodHub!")
         st.session_state.session_active = False
+        print(f"[{now_str()}] APP: exit keyword matched, session ended", flush=True)
     else:
         with st.spinner("Thinking..."):
             try:
                 reply = get_bot_response(st.session_state.cust_id, text, st.session_state.thread_id)
             except Exception as e:
                 reply = f"Sorry, something went wrong: {e}"
+                print(f"[{now_str()}] APP: get_bot_response raised {type(e).__name__}: {e}", flush=True)
         add_message("assistant", reply)
         st.session_state.last_active = time.time()
+        print(f"[{now_str()}] APP: bot replied, last_active reset", flush=True)
 
 
 # ---------------------------------------------------------------------------
