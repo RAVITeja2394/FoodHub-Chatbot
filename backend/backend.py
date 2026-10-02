@@ -1,5 +1,3 @@
-
-
 # --- Core LangChain / LangGraph imports ---
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END               # graph construction primitives
@@ -19,6 +17,9 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 
 import sqlite3
+import hashlib
+import json
+import shutil
 from datetime import datetime
 import uuid
 import os
@@ -71,12 +72,19 @@ db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
 # ---------------------------------------------------------------------------
 # MODEL CHAIN WITH FALLBACK
-# The first model is the primary; if a call to it raises (429 quota, 5xx, timeout,
-# structured-output parse failure...), LangChain automatically retries the SAME call on
-# the next model in the chain. The same GEMINI_TOKEN works for every Gemini model.
-# Override without code changes:  GEMINI_MODEL_CHAIN="modelA,modelB,modelC"
+# 1. gemini-3.8-flash: Frontier model. Unmatched speed, tool use, and 1M context.
+# 2. gemini-3.1-pro: High-reasoning flagship for complex logic/math.
+# 3. gemini-3.5-flash-lite: Ultrafast, lightweight text parsing handler.
+# 4. gemini-2.5-pro: Highly accurate baseline reasoning.
+# 5. gemini-2.5-flash: Resilient baseline production model.
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL_CHAIN = "gemini-3.5-flash-lite,gemini-2.5-flash-lite,gemini-2.5-pro"
+DEFAULT_MODEL_CHAIN = (
+    "gemini-3.8-flash,"
+    "gemini-3.1-pro,"
+    "gemini-3.5-flash-lite,"
+    "gemini-2.5-pro,"
+    "gemini-2.5-flash"
+)
 
 
 def parse_model_chain(value) -> list:
@@ -99,13 +107,66 @@ def build_with_fallbacks(models: list, transform=None):
     return runnables[0].with_fallbacks(runnables[1:])
 
 
+# ---------------------------------------------------------------------------
+# PER-MODEL TIMEOUTS (seconds)
+# Pro models "think" before answering, so they get a longer window than flash/lite.
+# A model that is not listed here uses DEFAULT_TIMEOUT_SECONDS.
+# Override without code changes:  GEMINI_MODEL_TIMEOUTS="gemini-3.1-pro=120,gemini-2.5-flash=40"
+# ---------------------------------------------------------------------------
+DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_MODEL_TIMEOUTS = {
+    "gemini-3.8-flash": 45,
+    "gemini-3.1-pro": 90,
+    "gemini-3.5-flash-lite": 30,
+    "gemini-2.5-pro": 90,
+    "gemini-2.5-flash": 45,
+}
+
+
+def parse_model_timeouts(value) -> dict:
+    """'a=30, b=90' -> {'a': 30.0, 'b': 90.0}. Malformed, non-numeric or non-positive
+    entries are ignored (so a typo in the env var can never disable a timeout)."""
+    result = {}
+    for part in (value or "").split(","):
+        if "=" not in part:
+            continue
+        name, _, secs = part.partition("=")
+        name = name.strip()
+        try:
+            secs = float(secs.strip())
+        except ValueError:
+            continue
+        if name and secs > 0:
+            result[name] = secs
+    return result
+
+
+MODEL_TIMEOUTS = {**DEFAULT_MODEL_TIMEOUTS, **parse_model_timeouts(os.environ.get("GEMINI_MODEL_TIMEOUTS"))}
+
+
+def get_model_timeout(name: str):
+    """Timeout in seconds for one model; DEFAULT_TIMEOUT_SECONDS if it isn't in the table."""
+    return MODEL_TIMEOUTS.get(name, DEFAULT_TIMEOUT_SECONDS)
+
+
 MODEL_CHAIN = parse_model_chain(os.environ.get("GEMINI_MODEL_CHAIN", DEFAULT_MODEL_CHAIN)) or parse_model_chain(DEFAULT_MODEL_CHAIN)
+
+# Using 'google_genai' partner package initialization syntax
 models = [
-    init_chat_model(model=name, model_provider='google_genai', api_key=gemini_key, temperature=0)
+    init_chat_model(
+        model=name,
+        model_provider='google_genai',
+        api_key=gemini_key,
+        temperature=0,
+        max_retries=0,                    # <--- CRITICAL ADDITION: fail over immediately instead of retrying the same model
+        timeout=get_model_timeout(name),  # <--- per-model timeout (see MODEL_TIMEOUTS above)
+    )
     for name in MODEL_CHAIN
 ]
-model = models[0]                                   # primary (used to build the SQL toolkit)
-resilient_model = build_with_fallbacks(models)      # plain text generation with fallback
+log_step("model chain ->", ", ".join(f"{n}({get_model_timeout(n):g}s)" for n in MODEL_CHAIN))
+
+model = models[0]                                   # Primary: gemini-3.8-flash (built for SQL/agents)
+resilient_model = build_with_fallbacks(models)      # Fallback chain for generic generation
 
 # Shared state — every node in the graph reads from and writes to this schema.
 class AgentState(TypedDict):
@@ -323,16 +384,75 @@ class GroundednessScore(BaseModel):
     score: Literal["GROUNDED", "NOT_GROUNDED"] = Field(description="Whether every claim in the answer is supported by the given context")
     confidence: float = Field(description="Confidence in this judgment, from 0.0 (not confident) to 1.0 (fully confident)", ge=0.0, le=1.0)
 
-def get_retreiver(file_path, chunk_size=1000, chunk_overlap=150, k=3, api_key=gemini_key):
-    """Builds a Chroma vector-store retriever from the FoodHub policy PDF.
-    Chunked with MarkdownTextSplitter so headers/bullet points stay reasonably intact."""
+EMBED_MODEL = "google_genai:gemini-embedding-001"
+CHROMA_DIR = os.path.join(BASE_DIR, "data", "chroma_policy_db")   # persisted vector index lives here
+CHROMA_COLLECTION = "policy_collection"
+_FINGERPRINT_FILE = "index_fingerprint.json"
+
+
+def compute_index_fingerprint(file_path, chunk_size, chunk_overlap, embed_model) -> str:
+    """Hash of everything that determines the index contents: the PDF's bytes, the chunking
+    settings and the embedding model. If any of these change, the stored index is stale."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    h.update(json.dumps(
+        {"chunk_size": chunk_size, "chunk_overlap": chunk_overlap, "embed_model": embed_model},
+        sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def read_saved_fingerprint(persist_dir):
+    """Fingerprint stored with the persisted index, or None if missing/corrupt."""
+    try:
+        with open(os.path.join(persist_dir, _FINGERPRINT_FILE), "r") as f:
+            return json.load(f).get("fingerprint")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def write_saved_fingerprint(persist_dir, fingerprint):
+    with open(os.path.join(persist_dir, _FINGERPRINT_FILE), "w") as f:
+        json.dump({"fingerprint": fingerprint}, f)
+
+
+def get_retreiver(file_path, chunk_size=1000, chunk_overlap=150, k=3, api_key=gemini_key, persist_dir=CHROMA_DIR):
+    """Returns a Chroma retriever over the FoodHub policy PDF.
+    The index is PERSISTED on disk and reused on every later start; it is rebuilt (re-embedded)
+    only when the PDF, chunking settings or embedding model change. Chunked with
+    MarkdownTextSplitter so headers/bullet points stay reasonably intact."""
+    embeddings = init_embeddings(model=EMBED_MODEL, api_key=api_key)
+    fingerprint = compute_index_fingerprint(file_path, chunk_size, chunk_overlap, EMBED_MODEL)
+
+    # 1. Reuse the stored index if it matches the current PDF/settings
+    if read_saved_fingerprint(persist_dir) == fingerprint:
+        try:
+            vec_db = Chroma(collection_name=CHROMA_COLLECTION, embedding_function=embeddings, persist_directory=persist_dir)
+            if vec_db.get(limit=1)["ids"]:
+                log_step("get_retreiver: loaded persisted index (no re-embedding)", persist_dir)
+                return vec_db.as_retriever(search_kwargs={"k": k})
+            log_step("get_retreiver: persisted index was empty, rebuilding")
+        except Exception as e:
+            log_step("get_retreiver: could not load persisted index, rebuilding", f"{type(e).__name__}: {e}")
+
+    # 2. Build (re-embed) from the PDF
+    log_step("get_retreiver: building index from PDF (embedding chunks)...")
     file_loader = PyMuPDF4LLMLoader(file_path).load()
     chunks = MarkdownTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap).split_documents(file_loader)
-    embeddings = init_embeddings(model="google_genai:gemini-embedding-001", api_key=api_key)
-    unique_collection = f"policy_collection_{uuid.uuid4().hex[:8]}"
-    vec_db = Chroma.from_documents(documents=chunks, embedding=embeddings, collection_name=unique_collection)
-    retreiver = vec_db.as_retriever(search_kwargs={"k": k})
-    return retreiver
+    try:
+        shutil.rmtree(persist_dir, ignore_errors=True)       # drop the stale index entirely
+        os.makedirs(persist_dir, exist_ok=True)
+        vec_db = Chroma.from_documents(documents=chunks, embedding=embeddings,
+                                       collection_name=CHROMA_COLLECTION, persist_directory=persist_dir)
+        write_saved_fingerprint(persist_dir, fingerprint)    # written LAST: a crash mid-embedding leaves no valid fingerprint
+        log_step("get_retreiver: index built and persisted", f"{len(chunks)} chunks -> {persist_dir}")
+    except OSError as e:
+        # read-only / unwritable filesystem: fall back to an in-memory index so the app still works
+        log_step("get_retreiver: cannot persist, using in-memory index", f"{type(e).__name__}: {e}")
+        vec_db = Chroma.from_documents(documents=chunks, embedding=embeddings,
+                                       collection_name=f"{CHROMA_COLLECTION}_{uuid.uuid4().hex[:8]}")
+    return vec_db.as_retriever(search_kwargs={"k": k})
 
 
 def check_relevance(question: str, contexts: list[str]) -> RelevanceScore:
