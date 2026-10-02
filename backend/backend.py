@@ -10,8 +10,6 @@ from langchain.embeddings import init_embeddings                   # provider-ag
 from langchain_chroma import Chroma                                 # vector store for RAG
 from langchain.agents import create_agent
 from langchain_community.utilities.sql_database import SQLDatabase  # wraps SQL connections for LangChain integration
-from langchain_community.agent_toolkits import SQLDatabaseToolkit   # exposes SQL tools (schema, query, checker) to the agent
-from langgraph.prebuilt import ToolNode, tools_condition            # pre-built tool-calling node + routing condition
 from langgraph.graph.message import add_messages                    # reducer that appends new messages to state
 from langgraph.checkpoint.memory import MemorySaver                 # in-memory checkpointer for multi-turn session memory
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -354,12 +352,12 @@ def refund_eligibility_handler(state: AgentState):
         }
     return {"result_source": "REFUND", "result_data": result}
 
-sql_tools = sql_toolkit.get_tools()
-# Only expose the query tool to the SQL model. Schema/list/checker tools were
-# allowing the agent to enter multi-step tool loops for simple order lookups.
-sql_query_tool = next((t for t in sql_tools if getattr(t, "name", "") == "sql_db_query"), None)
-if sql_query_tool is None:
-    raise RuntimeError("sql_db_query tool is unavailable in SQLDatabaseToolkit")
+# The SQL path is single-pass. We expose one tool schema to the SQL LLM so it
+# produces one SELECT; sql_node() executes that query directly and exactly once.
+@tool("sql_db_query")
+def sql_query_tool(query: str) -> str:
+    """Generate exactly one read-only SELECT for the authenticated customer's orders table."""
+    return query
 
 # Forces the classifier's output into exactly these two fields, each from a fixed
 # set of allowed values — never free text the rest of the graph would have to parse.
