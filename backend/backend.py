@@ -15,6 +15,7 @@ from langgraph.graph.message import add_messages                    # reducer th
 from langgraph.checkpoint.memory import MemorySaver                 # in-memory checkpointer for multi-turn session memory
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableLambda
 
 import sqlite3
 import hashlib
@@ -97,11 +98,67 @@ def parse_model_chain(value) -> list:
     return names
 
 
+def _is_timeout_error(exc: Exception) -> bool:
+    """Return True only for timeout/deadline-style failures.
+
+    We intentionally do NOT treat ordinary slowness as a fallback condition.
+    A timeout gets exactly one retry on the same model; only after that retry
+    fails does the surrounding `with_fallbacks` chain move to the next model.
+    """
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__.lower()
+        text = str(current).lower()
+        if (
+            "timeout" in name
+            or "deadlineexceeded" in name
+            or "readtimeout" in name
+            or "timed out" in text
+            or "deadline exceeded" in text
+            or "read operation timed out" in text
+        ):
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return False
+
+
+def _wrap_same_model_timeout_retry(runnable, model_name: str):
+    """Retry one model exactly once when its call times out, then re-raise.
+
+    Re-raising is important: LangChain's `with_fallbacks` then selects the next
+    model for 503/rate-limit/unavailable errors and for a timeout that exhausted
+    its one retry.
+    """
+    def invoke_with_retry(input_data, config=None):
+        try:
+            return runnable.invoke(input_data, config=config)
+        except Exception as first_error:
+            if not _is_timeout_error(first_error):
+                raise
+            log_step("model timeout -> retrying same model", model_name)
+            try:
+                return runnable.invoke(input_data, config=config)
+            except Exception as second_error:
+                log_step("model retry failed -> fallback", f"{model_name}: {type(second_error).__name__}: {second_error}")
+                raise
+
+    return RunnableLambda(invoke_with_retry)
+
+
 def build_with_fallbacks(models: list, transform=None):
-    """Applies `transform` (e.g. with_structured_output / bind_tools) to EVERY model in the
-    chain, then returns primary.with_fallbacks([...rest]). With a single model it just
-    returns that model's runnable unchanged."""
-    runnables = [transform(m) if transform else m for m in models]
+    """Build a model chain with the required timeout/fallback semantics.
+
+    For each model: invoke normally -> if it times out, retry that SAME model
+    once -> if the retry also fails, or if the first call fails with a genuine
+    service error such as 503/rate-limit/model-unavailable, re-raise so
+    `with_fallbacks` moves to the next model.
+    """
+    runnables = []
+    for model_name, model_runnable in zip(MODEL_CHAIN, models):
+        transformed = transform(model_runnable) if transform else model_runnable
+        runnables.append(_wrap_same_model_timeout_retry(transformed, model_name))
     if len(runnables) == 1:
         return runnables[0]
     return runnables[0].with_fallbacks(runnables[1:])
@@ -158,7 +215,7 @@ models = [
         model_provider='google_genai',
         api_key=gemini_key,
         temperature=0,
-        max_retries=0,                    # <--- CRITICAL ADDITION: fail over immediately instead of retrying the same model
+        max_retries=0,                    # fallback/retry policy is handled explicitly below
         timeout=get_model_timeout(name),  # <--- per-model timeout (see MODEL_TIMEOUTS above)
     )
     for name in MODEL_CHAIN
