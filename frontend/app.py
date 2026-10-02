@@ -62,6 +62,8 @@ defaults = {
     "last_active": None,
     "greeted": False,
     "pending_input": None,
+    "processing": False,
+    "awaiting_text": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -98,11 +100,23 @@ def add_message(role: str, content: str):
     st.session_state.messages.append({"role": role, "content": content, "time": now_str()})
 
 
-def handle_user_message(text: str):
+def queue_user_message(text: str):
+    """Phase 1 - runs on the rerun where the user just typed/clicked something.
+    Shows their message immediately and marks 'processing' so the NEXT rerun
+    (with autorefresh unmounted) actually calls the slow backend."""
     st.session_state.last_active = time.time()
     st.session_state.first_message_sent = True
     add_message("user", text)
     print(f"[{now_str()}] APP: user message -> {text[:60]!r}", flush=True)
+    st.session_state.processing = True
+    st.session_state.awaiting_text = text
+
+
+def process_pending_message():
+    """Phase 2 - runs on the follow-up rerun. st_autorefresh is NOT mounted
+    during this call (see main area below), so a slow backend call can no
+    longer be cancelled mid-flight by an autorefresh-triggered rerun."""
+    text = st.session_state.awaiting_text
 
     if text.strip().lower() in EXIT_KEYWORDS:
         add_message("assistant", "Session ended. Thank you for contacting FoodHub!")
@@ -118,6 +132,9 @@ def handle_user_message(text: str):
         add_message("assistant", reply)
         st.session_state.last_active = time.time()
         print(f"[{now_str()}] APP: bot replied, last_active reset", flush=True)
+
+    st.session_state.processing = False
+    st.session_state.awaiting_text = None
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +192,17 @@ if not st.session_state.session_active:
         unsafe_allow_html=True,
     )
 else:
+    # If a message is queued from the previous rerun, process it now.
+    # IMPORTANT: st_autorefresh is intentionally NOT mounted during this branch,
+    # so a slow backend call can't be cancelled mid-flight by an autorefresh-
+    # triggered rerun (that was the bug causing replies to vanish).
+    if st.session_state.processing:
+        process_pending_message()
+        st.rerun()
+
     # Idle-timeout check (real periodic check if streamlit_autorefresh installed,
     # otherwise checked lazily on the next rerun/interaction).
+    # Only mounted when NOT processing a message - see comment above.
     if AUTOREFRESH_AVAILABLE:
         st_autorefresh(interval=5000, key="idle_check")
 
@@ -228,5 +254,5 @@ else:
     st.session_state.pending_input = None
 
     if final_input:
-        handle_user_message(final_input)
+        queue_user_message(final_input)
         st.rerun()
