@@ -1177,27 +1177,83 @@ def _safe_customer_query(query: str, cust_id: str) -> str:
     """Execute exactly one read-only SELECT scoped to the authenticated customer."""
     q = (query or "").strip()
     q_low = q.lower()
-    if not re.match(r"^select\b", q_low) or ";" in q or "--" in q or "/*" in q_low or "*/" in q_low:
+
+    # Always log the SQL that the LLM generated.
+    log_step("sql_node: GENERATED SQL ->", q if q else "<EMPTY>")
+
+    if not q:
+        log_step("sql_node: QUERY_ERROR ->", "empty SQL query")
         return "QUERY_ERROR"
+
+    if not re.match(r"^select\b", q_low):
+        log_step("sql_node: QUERY_ERROR ->", "query is not a SELECT statement")
+        return "QUERY_ERROR"
+
+    if ";" in q:
+        log_step("sql_node: QUERY_ERROR ->", "semicolon/multiple SQL statements are not allowed")
+        return "QUERY_ERROR"
+
+    if "--" in q or "/*" in q_low or "*/" in q_low:
+        log_step("sql_node: QUERY_ERROR ->", "SQL comments are not allowed")
+        return "QUERY_ERROR"
+
     if not re.search(r"\bfrom\s+orders\b", q_low):
+        log_step("sql_node: QUERY_ERROR ->", "query does not use the orders table")
         return "QUERY_ERROR"
+
     escaped = re.escape(str(cust_id))
-    if not re.search(rf"\bcustomer_id\s*=\s*[\"']?{escaped}[\"']?", q, flags=re.IGNORECASE):
+
+    if not re.search(
+        rf"\bcustomer_id\s*=\s*[\x22\x27]?{escaped}[\x22\x27]?",
+        q,
+        flags=re.IGNORECASE,
+    ):
+        log_step(
+            "sql_node: QUERY_ERROR ->",
+            f"missing required customer_id={cust_id} filter",
+        )
         return "QUERY_ERROR"
-    if re.search(r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma|vacuum)\b", q_low):
+
+    if re.search(
+        r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma)\b",
+        q_low,
+    ):
+        log_step(
+            "sql_node: QUERY_ERROR ->",
+            "write/DDL/PRAGMA SQL is not allowed",
+        )
         return "QUERY_ERROR"
+
     try:
         uri = f"file:{DB_PATH}?mode=ro"
+
         with sqlite3.connect(uri, uri=True) as conn:
             cur = conn.cursor()
             cur.execute(q)
+
             rows = cur.fetchall()
             columns = [d[0] for d in cur.description or []]
+
     except Exception as exc:
-        log_step("sql_node: database query failed", _short_error(exc))
+        log_step(
+            "sql_node: QUERY_ERROR ->",
+            f"{type(exc).__name__}: {exc}",
+        )
+        log_step(
+            "sql_node: FAILED SQL ->",
+            q,
+        )
         return "QUERY_ERROR"
+
     if not rows:
+        log_step("sql_node: database result ->", "NOT_FOUND")
         return "NOT_FOUND"
+
+    log_step(
+        "sql_node: SQL execution successful ->",
+        f"rows={len(rows)}, columns={columns}",
+    )
+
     return "\n".join(
         ", ".join(f"{col}: {val}" for col, val in zip(columns, row))
         for row in rows
@@ -1207,32 +1263,119 @@ def _safe_customer_query(query: str, cust_id: str) -> str:
 def sql_node(state: AgentState):
     """One SQL-generation LLM call, then one customer-scoped DB execution. No ToolNode loop."""
     log_step("sql_node: calling SQL_model.invoke...")
+
     try:
         schema = db.get_table_info(["orders"])
     except Exception:
-        schema = "orders table schema could not be loaded; use only fields known from the prompt and SELECT only."
-    prompt = SQL_AGENT_PROMPT.format(cust_id=state["cust_id"], schema=schema)
+        schema = (
+            "orders table schema could not be loaded; "
+            "use only fields known from the prompt and SELECT only."
+        )
+
+    prompt = SQL_AGENT_PROMPT.format(
+        cust_id=state["cust_id"],
+        schema=schema,
+    )
+
     messages = [SystemMessage(content=prompt)] + state["messages"]
+
     result = SQL_model.invoke(messages)
+
     tool_calls = getattr(result, "tool_calls", None) or []
-    log_step("sql_node: done ->", f"tool_calls={len(tool_calls)}")
 
+    log_step(
+        "sql_node: done ->",
+        f"tool_calls={len(tool_calls)}",
+    )
+
+    # LLM returned text instead of a tool call
     if not tool_calls:
-        raw = extract_text(getattr(result, "content", "")).strip()
-        return {"result_source": "SQL", "result_data": raw or "QUERY_ERROR"}
+        raw = extract_text(
+            getattr(result, "content", "")
+        ).strip()
 
+        if not raw:
+            log_step(
+                "sql_node: QUERY_ERROR ->",
+                "LLM returned neither tool call nor text",
+            )
+
+        return {
+            "result_source": "SQL",
+            "result_data": raw or "QUERY_ERROR",
+        }
+
+    # Get the first SQL tool call
     call = tool_calls[0]
-    args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
-    query = args.get("query") if isinstance(args, dict) else None
-    if not query:
-        return {"result_source": "SQL", "result_data": "QUERY_ERROR"}
-    if len(tool_calls) > 1:
-        log_step("sql_node: multiple tool calls requested", "executing only the first")
 
-    log_step("sql_node: executing one customer-scoped SELECT")
-    sql_result = _safe_customer_query(query, state["cust_id"])
-    log_step("sql_node: database result ->", sql_result[:200])
-    return {"result_source": "SQL", "result_data": sql_result}
+    args = (
+        call.get("args", {})
+        if isinstance(call, dict)
+        else getattr(call, "args", {})
+    )
+
+    query = (
+        args.get("query")
+        if isinstance(args, dict)
+        else None
+    )
+
+    # IMPORTANT: show the actual SQL generated by the SQL LLM
+    log_step(
+        "sql_node: GENERATED SQL ->",
+        query or "<EMPTY>",
+    )
+
+    # Tool call exists but contains no SQL
+    if not query:
+        log_step(
+            "sql_node: QUERY_ERROR ->",
+            f"LLM returned a tool call without SQL query; args={args}",
+        )
+
+        return {
+            "result_source": "SQL",
+            "result_data": "QUERY_ERROR",
+        }
+
+    # We intentionally execute only the first tool call
+    if len(tool_calls) > 1:
+        log_step(
+            "sql_node: multiple tool calls requested",
+            "executing only the first",
+        )
+
+    # Execute the generated SQL
+    log_step(
+        "sql_node: executing one customer-scoped SELECT"
+    )
+
+    log_step(
+        "sql_node: executing SQL ->",
+        query,
+    )
+
+    sql_result = _safe_customer_query(
+        query,
+        state["cust_id"],
+    )
+
+    log_step(
+        "sql_node: database result ->",
+        sql_result[:500],
+    )
+
+    # Explicitly log the generated SQL when DB execution fails
+    if sql_result == "QUERY_ERROR":
+        log_step(
+            "sql_node: FINAL QUERY_ERROR ->",
+            f"customer_id={state['cust_id']}; SQL={query}",
+        )
+
+    return {
+        "result_source": "SQL",
+        "result_data": sql_result,
+    }
 
 def _latest_user_question(state: AgentState) -> str:
     for msg in reversed(state.get("messages", [])):
