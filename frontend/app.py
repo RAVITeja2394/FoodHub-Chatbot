@@ -26,10 +26,11 @@ try:
         gemini_secret = st.secrets.get("GEMINI_TOKEN")
         if gemini_secret:
             os.environ["GEMINI_TOKEN"] = str(gemini_secret)
-    if not os.environ.get("GROQ_API_KEY"):
-        groq_secret = st.secrets.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY2")
-        if groq_secret:
-            os.environ["GROQ_API_KEY"] = str(groq_secret)
+    for groq_env_name in ("GROQ_API_KEY", "GROQ_API_KEY2"):
+        if not os.environ.get(groq_env_name):
+            groq_secret = st.secrets.get(groq_env_name)
+            if groq_secret:
+                os.environ[groq_env_name] = str(groq_secret)
 except Exception:
     # Environment variables remain the normal deployment path. Missing
     # Streamlit secrets must not crash the UI before the backend is imported.
