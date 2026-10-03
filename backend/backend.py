@@ -512,31 +512,46 @@ GROQ_MODEL_CHAIN = parse_model_chain(
     os.environ.get("GROQ_MODEL_CHAIN", DEFAULT_GROQ_MODEL_CHAIN)
 ) or parse_model_chain(DEFAULT_GROQ_MODEL_CHAIN)
 
-# Key loading is compatible with the user's previous setup:
-# 1) GROQ_API_KEY environment variable
-# 2) GROQ_API_KEY2 from Google Colab Secrets
-# 3) interactive getpass only when stdin is actually interactive
-# In Streamlit/non-interactive deployment, we do NOT block waiting for input;
-# Groq simply remains disabled if no key was configured.
-groq_key = os.environ.get("GROQ_API_KEY")
-if not groq_key:
-    try:
-        from google.colab import userdata
-        groq_key = userdata.get("GROQ_API_KEY2")
-    except Exception:
-        groq_key = None
-if not groq_key and sys.stdin is not None and sys.stdin.isatty():
+# Load two independent Groq account keys. Key 2 is a distinct fallback account,
+# tried only after key 1's model chain exhausts its configured rate-limit retries.
+# Each account can be configured independently in environment/Streamlit secrets.
+groq_keys = []
+for env_name in ("GROQ_API_KEY", "GROQ_API_KEY2"):
+    value = os.environ.get(env_name, "").strip()
+    if value and value not in groq_keys:
+        groq_keys.append(value)
+
+# Colab secret compatibility: accept either named secret when not already set.
+try:
+    from google.colab import userdata
+    for secret_name in ("GROQ_API_KEY", "GROQ_API_KEY2"):
+        if len(groq_keys) >= 2:
+            break
+        try:
+            value = (userdata.get(secret_name) or "").strip()
+            if value and value not in groq_keys:
+                groq_keys.append(value)
+        except Exception:
+            pass
+except Exception:
+    pass
+
+if not groq_keys and sys.stdin is not None and sys.stdin.isatty():
     try:
         from getpass import getpass
-        groq_key = getpass("Enter your GROQ_API_KEY: ").strip()
+        value = getpass("Enter your GROQ_API_KEY: ").strip()
+        if value:
+            groq_keys.append(value)
     except Exception:
-        groq_key = None
-if groq_key:
-    os.environ["GROQ_API_KEY"] = groq_key
-    print("Groq API key loaded.", flush=True)
+        pass
+
+# Retain compatibility for any project code that reads this environment key.
+if groq_keys:
+    os.environ["GROQ_API_KEY"] = groq_keys[0]
+    print(f"Groq API key(s) loaded: {len(groq_keys)} account(s).", flush=True)
 else:
     os.environ.setdefault("GROQ_API_KEY", "")
-    log_step("model chain warning ->", "GROQ_API_KEY is not set; Groq fallback disabled")
+    log_step("model chain warning ->", "No Groq API key configured; Groq fallback disabled")
 
 model_entries = []
 for name in MODEL_CHAIN:
@@ -554,19 +569,22 @@ for name in MODEL_CHAIN:
     gemini_runnable = init_chat_model(**kwargs)
     model_entries.append((f"gemini:{name}", RateLimitedGemini(gemini_runnable, f"gemini:{name}")))
 
-if groq_key:
-    for name in GROQ_MODEL_CHAIN:
-        kwargs = {
-            "model": name,
-            "api_key": groq_key,
-            "temperature": 0,
-            "max_retries": 0,
-            "max_tokens": LLM_MAX_TOKENS,
-        }
-        timeout = get_model_timeout(name)
-        if timeout:
-            kwargs["timeout"] = timeout
-        model_entries.append((f"groq:{name}", RateLimitedChatGroq(**kwargs)))
+if groq_keys:
+    # Keep account order deterministic: account 1 first, then account 2. For each
+    # account, try every configured Groq model before moving to the next account.
+    for account_index, account_key in enumerate(groq_keys, start=1):
+        for name in GROQ_MODEL_CHAIN:
+            kwargs = {
+                "model": name,
+                "api_key": account_key,
+                "temperature": 0,
+                "max_retries": 0,
+                "max_tokens": LLM_MAX_TOKENS,
+            }
+            timeout = get_model_timeout(name)
+            if timeout:
+                kwargs["timeout"] = timeout
+            model_entries.append((f"groq:account{account_index}:{name}", RateLimitedChatGroq(**kwargs)))
 
 if not model_entries:
     raise ValueError("No chat models are configured.")
@@ -771,7 +789,12 @@ def refund_eligibility_handler(state: AgentState):
         }
     return {"result_source": "REFUND", "result_data": result}
 
-sql_toolkit = SQLDatabaseToolkit(db=db, llm=model)
+# SQLDatabaseToolkit validates `llm` as a LangChain BaseLanguageModel.
+# RateLimitedGemini is a request-budget wrapper, so pass its underlying
+# LangChain model to the toolkit for schema/tool construction. Runtime SQL model
+# calls still use SQL_model, which retains rate limiting and provider fallback.
+toolkit_llm = getattr(model, "_runnable", model)
+sql_toolkit = SQLDatabaseToolkit(db=db, llm=toolkit_llm)
 
 sql_tools = sql_toolkit.get_tools()
 sql_query_tool = next((t for t in sql_tools if getattr(t, "name", "") == "sql_db_query"), None)
