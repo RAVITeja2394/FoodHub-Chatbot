@@ -216,72 +216,50 @@ def queue_user_message(text: str):
     st.session_state.duplicate_log_at = 0
     _register_request(st.session_state.thread_id, request_id)
 
-
 def process_pending_message():
-    """Execute one request, with process-wide idempotency across Streamlit reruns."""
+    """Process the pending user message synchronously and display the reply."""
     thread_id = st.session_state.thread_id
-    request_id = st.session_state.pending_request_id
     text = st.session_state.awaiting_text
-
-    status, cached_reply = _claim_request(thread_id, request_id)
-
-    if status == "running":
-        # Do not spam logs on every 2s polling rerun. The backend request is still active.
-        last_log = st.session_state.get("duplicate_log_at", 0)
-        if time.time() - last_log >= 15:
-            print(f"[{now_str()}] APP: waiting for active backend request", flush=True)
-            st.session_state.duplicate_log_at = time.time()
-        if AUTOREFRESH_AVAILABLE:
-            st_autorefresh(interval=2000, key=f"wait_for_reply_{request_id}")
-        return False
-
-    if status == "completed":
-        claimed, reply = _deliver_request_once(thread_id, request_id)
-        if claimed:
-            add_message("assistant", reply)
-            st.session_state.last_active = time.time()
-            print(f"[{now_str()}] APP: delivered cached backend reply", flush=True)
-        st.session_state.processing = False
-        st.session_state.awaiting_text = None
-        st.session_state.pending_request_id = None
-        return True
-
-    if status != "claimed":
-        # The session may have been cleared/restarted. Never submit an unknown
-        # stale request to the backend.
-        st.session_state.processing = False
-        st.session_state.awaiting_text = None
-        st.session_state.pending_request_id = None
-        return True
 
     try:
         if text and text.strip().lower() in EXIT_KEYWORDS:
             reply = "Session ended. Thank you for contacting FoodHub!"
             end_session(reply)
-        else:
-            with st.spinner("Thinking..."):
-                try:
-                    reply = get_bot_response(
-                        st.session_state.cust_id,
-                        text,
-                        thread_id,
-                    )
-                except Exception as e:
-                    print(f"[{now_str()}] APP: get_bot_response raised {type(e).__name__}: {e}", flush=True)
-                    reply = "Sorry, I could not complete that request because the AI service is temporarily unavailable. Please try again."
+            return True
 
-            _complete_request(thread_id, request_id, reply)
-            claimed, delivered_reply = _deliver_request_once(thread_id, request_id)
-            if claimed:
-                add_message("assistant", delivered_reply)
-                st.session_state.last_active = time.time()
-                print(f"[{now_str()}] APP: bot replied, last_active reset", flush=True)
+        with st.spinner("Thinking..."):
+            try:
+                reply = get_bot_response(
+                    st.session_state.cust_id,
+                    text,
+                    thread_id,
+                )
+            except Exception as e:
+                print(
+                    f"[{now_str()}] APP: get_bot_response raised "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+                reply = (
+                    "Sorry, I could not complete that request because "
+                    "the AI service is temporarily unavailable. Please try again."
+                )
+
+        # Backend has completed, so immediately add its response to the chat.
+        add_message("assistant", reply)
+        st.session_state.last_active = time.time()
+
+        print(
+            f"[{now_str()}] APP: bot replied -> {reply[:120]!r}",
+            flush=True,
+        )
+
+        return True
+
     finally:
         st.session_state.processing = False
         st.session_state.awaiting_text = None
         st.session_state.pending_request_id = None
-
-    return True
 
 def render_chat_history():
     for msg in st.session_state.messages:
