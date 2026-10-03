@@ -588,7 +588,7 @@ else:
 # ------------------------------------------------------------------
 model_entries = []
 
-
+GROQ_MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "800"))
 # ------------------------------------------------------------------
 # 1. GROQ PRIMARY
 # ------------------------------------------------------------------
@@ -600,12 +600,13 @@ if groq_keys:
         for name in GROQ_MODEL_CHAIN:
 
             kwargs = {
-                "model": name,
-                "api_key": account_key,
-                "temperature": 0,
-                "max_retries": 0,
-                "max_tokens": LLM_MAX_TOKENS,
-            }
+    "model": name,
+    "api_key": account_key,
+    "temperature": 0,
+    "max_retries": 0,
+    "max_tokens": GROQ_MAX_TOKENS,
+    "reasoning_effort": "low",
+}
 
             timeout = get_model_timeout(name)
 
@@ -691,7 +692,38 @@ class AgentState(TypedDict, total=False):
     frustration_level: str
     result_source: str
     result_data: object
+class JsonFallback:
+    def __init__(self, primary, raw_model, schema, label=""):
+        self.primary, self.raw, self.schema, self.label = primary, raw_model, schema, label
 
+    def invoke(self, input_value, config=None, **kwargs):
+        try:
+            return self.primary.invoke(input_value, config=config, **kwargs)
+        except Exception as exc:
+            msg = str(exc).lower()
+            # Rate limits, timeouts and outages: don't retry the same provider here.
+            # Re-raise so build_with_fallbacks moves on to the next model.
+            if is_rate_limit(exc) or _is_timeout_error(exc) or any(
+                k in msg for k in ("503", "502", "unavailable", "overloaded")
+            ):
+                raise
+            # Anything else (e.g. malformed structured output / tool_use_failed):
+            # fall through to the plain JSON-text retry below.
+            log_step("structured: primary mode failed, JSON-text fallback",
+                     f"{self.label}; {type(exc).__name__}: {_short_error(exc)}")
+
+        msgs = list(input_value) if isinstance(input_value, (list, tuple)) \
+               else [HumanMessage(content=str(input_value))]
+        msgs.append(HumanMessage(content=(
+            "Reply with ONLY one JSON object matching this JSON schema. "
+            "No prose, no markdown fences.\n" + json.dumps(self.schema.model_json_schema())
+        )))
+        text = extract_text(self.raw.invoke(msgs, config=config).content)
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            raise ValueError(f"No JSON object in model output: {text[:200]}")
+        return self.schema.model_validate_json(match.group(0))
+           
 def get_session_config(cust_id: str, thread_id: str = None):
     """Builds the LangGraph config + initial state for one customer session.
     thread_id ties this conversation to LangGraph's memory checkpointer, so the
@@ -837,6 +869,17 @@ def _parse_clock_time(value):
         except ValueError:
             continue
     return None
+def _structured(label, m, schema):
+    """Provider-aware structured output.
+    - Groq: JSON-schema mode (avoids the forced tool-call that gpt-oss gets wrong)
+    - Gemini: native response schema (default behaviour, works today)
+    """
+    if label.startswith("groq:"):
+        primary = m.with_structured_output(schema, method="json_schema")
+    else:
+        primary = m.with_structured_output(schema)
+    return JsonFallback(primary, m, schema, label)
+
 
 
 def refund_eligibility_handler(state: AgentState):
@@ -1021,13 +1064,16 @@ that judgment."""
     result = groundedness_judge.invoke(prompt)
     return result
 
-classifier_entries = [(label, m.with_structured_output(ClassifierSchema)) for label, m in model_entries]
+# classifier_entries = [(label, m.with_structured_output(ClassifierSchema)) for label, m in model_entries]
+classifier_entries    = [(l, _structured(l, m, ClassifierSchema))   for l, m in model_entries]
 classifier_model = build_with_fallbacks(classifier_entries)
 SQL_entries = [(label, m.bind_tools([sql_query_tool])) for label, m in model_entries]
 SQL_model = build_with_fallbacks(SQL_entries)
-relevance_entries = [(label, m.with_structured_output(RelevanceScore)) for label, m in model_entries]
+# relevance_entries = [(label, m.with_structured_output(RelevanceScore)) for label, m in model_entries]
+relevance_entries     = [(l, _structured(l, m, RelevanceScore))     for l, m in model_entries]
 relevance_judge = build_with_fallbacks(relevance_entries)
-groundedness_entries = [(label, m.with_structured_output(GroundednessScore)) for label, m in model_entries]
+# groundedness_entries = [(label, m.with_structured_output(GroundednessScore)) for label, m in model_entries]
+groundedness_entries  = [(l, _structured(l, m, GroundednessScore))  for l, m in model_entries]
 groundedness_judge = build_with_fallbacks(groundedness_entries)
 
 
