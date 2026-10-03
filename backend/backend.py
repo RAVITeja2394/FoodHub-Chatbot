@@ -10,6 +10,7 @@ from langchain.embeddings import init_embeddings                   # provider-ag
 from langchain_chroma import Chroma                                 # vector store for RAG
 from langchain.agents import create_agent
 from langchain_community.utilities.sql_database import SQLDatabase  # wraps SQL connections for LangChain integration
+from langchain_community.agent_toolkits import SQLDatabaseToolkit   # exposes SQL tools (schema, query, checker) to the agent
 from langgraph.graph.message import add_messages                    # reducer that appends new messages to state
 from langgraph.checkpoint.memory import MemorySaver                 # in-memory checkpointer for multi-turn session memory
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -28,6 +29,9 @@ import numpy as np
 from random import randint
 import logging
 import re
+import sys
+import random
+import threading
 
 # Schema Validation
 from pydantic import BaseModel, Field
@@ -46,7 +50,6 @@ os.environ["PYMUPDF_MESSAGE"] = ""    # To supress OCR messages in Retreiver
 
 
 gemini_key = os.environ.get("GEMINI_TOKEN")
-groq_key = os.environ.get("GROQ_API_KEY")
 if not gemini_key:
        raise ValueError("GEMINI_TOKEN environment variable is not set.")
 
@@ -73,21 +76,343 @@ db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
 
 # ---------------------------------------------------------------------------
-# MODEL CHAIN WITH FALLBACK
-# 1. gemini-3.8-flash: Frontier model. Unmatched speed, tool use, and 1M context.
-# 2. gemini-3.1-pro: High-reasoning flagship for complex logic/math.
-# 3. gemini-3.5-flash-lite: Ultrafast, lightweight text parsing handler.
-# 4. gemini-2.5-pro: Highly accurate baseline reasoning.
-# 5. gemini-2.5-flash: Resilient baseline production model.
+# MODEL CHAIN WITH FALLBACK + GROQ TOKEN/RATE-LIMIT GUARD
+# ---------------------------------------------------------------------------
+# Gemini is PRIMARY. Groq is FALLBACK.
+#
+# Provider semantics:
+#   * Normal latency is allowed; there is no artificial short deadline here.
+#   * If a real timeout occurs, the SAME model is retried once.
+#   * 429/quota/503/etc. immediately move to the next model/provider.
+#   * A successful fallback result is returned; an earlier provider exception is
+#     never re-raised after a later provider succeeds.
+#
+# Groq free-tier protection:
+#   * A single shared rolling 60-second token budget is used for every Groq call.
+#   * The budget reserves estimated input + max-output tokens before the request.
+#   * A 429 is parsed for the server-provided retry delay and retried internally.
+#   * SDK retries are disabled so there is only one owner of retry/backoff logic.
+#   * The limits are configurable with environment variables because Groq limits
+#     are account/model dependent and can change.
 # ---------------------------------------------------------------------------
 DEFAULT_GEMINI_MODEL_CHAIN = (
-    # Keep Gemini short: the logs showed the middle models timing out repeatedly.
-    "gemini-3.8-flash,gemini-3.5-flash-lite"
+    "gemini-3.8-flash,"
+    "gemini-3.1-pro,"
+    "gemini-3.5-flash-lite,"
+    "gemini-2.5-pro,"
+    "gemini-2.5-flash"
 )
-DEFAULT_GROQ_MODEL_CHAIN = "openai/gpt-oss-20b"
+# Default to the model used by the user's previous Groq setup. Override with
+# GROQ_MODEL_CHAIN when the account exposes a different model/limit.
+DEFAULT_GROQ_MODEL_CHAIN = "openai/gpt-oss-120b"
+
+# ---- Groq free-tier rate-limit controls -----------------------------------
+# These are deliberately configurable. 8000 is a conservative starting point,
+# not a claim about every Groq account/model. Set GROQ_TPM_LIMIT to the exact
+# TPM shown in console.groq.com/settings/limits for the selected model.
+TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", "8000"))
+TPM_SAFETY = float(os.environ.get("GROQ_TPM_SAFETY", "0.80"))
+RATE_RETRIES = int(os.environ.get("GROQ_RATE_RETRIES", "6"))
+
+# Gemini has its own project/model-specific RPM and TPM quotas. These defaults are
+# deliberately conservative and configurable; set them to the limits shown for
+# the selected Gemini model/project in Google AI Studio / Google Cloud.
+GEMINI_TPM_LIMIT = int(os.environ.get("GEMINI_TPM_LIMIT", "30000"))
+GEMINI_RPM_LIMIT = int(os.environ.get("GEMINI_RPM_LIMIT", "15"))
+GEMINI_TPM_SAFETY = float(os.environ.get("GEMINI_TPM_SAFETY", "0.80"))
+GEMINI_RPM_SAFETY = float(os.environ.get("GEMINI_RPM_SAFETY", "0.80"))
+GEMINI_RATE_RETRIES = int(os.environ.get("GEMINI_RATE_RETRIES", "3"))
+
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
+
+# These controls are retained as configuration knobs from the earlier project
+# implementation. FoodHub's current graph does not use DuckDuckGo/interest
+# filtering or a ReAct web-search agent, so they are intentionally not wired
+# into unrelated nodes.
+MAX_INTERESTS = int(os.environ.get("MAX_INTERESTS", "2"))
+MAX_RESULTS_PER_QUERY = int(os.environ.get("MAX_RESULTS_PER_QUERY", "5"))
+MAX_BODY_CHARS = int(os.environ.get("MAX_BODY_CHARS", "700"))
+MAX_RESULTS_TO_FILTER = int(os.environ.get("MAX_RESULTS_TO_FILTER", "8"))
+MAX_URLS_TO_SUMMARIZE = int(os.environ.get("MAX_URLS_TO_SUMMARIZE", "5"))
+AGENT_RECURSION_LIMIT = int(os.environ.get("AGENT_RECURSION_LIMIT", "12"))
+# The finalized FoodHub architecture deliberately avoids a ReAct loop for SQL.
+USE_AGENT = False
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+class TokenBudget:
+    """Thread-safe rolling 60-second token budget for Groq calls."""
+
+    def __init__(self, tpm_limit: int, safety: float = 0.8):
+        self.raw_limit = max(1, int(tpm_limit))
+        self.limit = max(1, int(self.raw_limit * max(0.1, min(safety, 1.0))))
+        self.events = []  # [{timestamp, tokens, reservation_id}]
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def _prune_locked(self) -> None:
+        cutoff = _time.time() - 60.0
+        self.events = [e for e in self.events if e["timestamp"] > cutoff]
+
+    def used(self) -> int:
+        with self._lock:
+            self._prune_locked()
+            return int(sum(e["tokens"] for e in self.events))
+
+    def reserve(self, tokens: int) -> str:
+        """Block until the estimated request fits, then reserve it."""
+        tokens = max(1, min(int(tokens), self.limit))
+        while True:
+            with self._lock:
+                self._prune_locked()
+                used = sum(e["tokens"] for e in self.events)
+                if used + tokens <= self.limit or not self.events:
+                    self._next_id += 1
+                    reservation_id = str(self._next_id)
+                    self.events.append({
+                        "timestamp": _time.time(),
+                        "tokens": tokens,
+                        "reservation_id": reservation_id,
+                    })
+                    return reservation_id
+                oldest = self.events[0]
+                wait = max(61.0 - (_time.time() - oldest["timestamp"]), 1.0)
+            print(
+                f"  [budget] {used}/{self.limit} tokens used this minute - "
+                f"waiting {wait:.0f}s for the window to refill",
+                flush=True,
+            )
+            _time.sleep(wait)
+
+    def settle(self, reservation_id: str, actual: int) -> None:
+        """Replace the estimate with API-reported total token usage."""
+        if not actual:
+            return
+        with self._lock:
+            for event in reversed(self.events):
+                if event["reservation_id"] == reservation_id:
+                    event["tokens"] = min(max(int(actual), 1), self.limit)
+                    return
+
+    def penalise(self, reservation_id: str | None = None) -> None:
+        """After a 429, conservatively treat the current window as full."""
+        with self._lock:
+            if reservation_id:
+                for event in reversed(self.events):
+                    if event["reservation_id"] == reservation_id:
+                        event["tokens"] = self.limit
+                        return
+            self.events.append({
+                "timestamp": _time.time(),
+                "tokens": self.limit,
+                "reservation_id": "429",
+            })
+
+    def clear(self) -> None:
+        with self._lock:
+            self.events.clear()
+
+
+BUDGET = TokenBudget(TPM_LIMIT, TPM_SAFETY)
+GEMINI_TOKEN_BUDGET = TokenBudget(GEMINI_TPM_LIMIT, GEMINI_TPM_SAFETY)
+
+
+class RequestBudget:
+    """Thread-safe rolling 60-second request-per-minute budget."""
+
+    def __init__(self, rpm_limit: int, safety: float = 0.8):
+        self.raw_limit = max(1, int(rpm_limit))
+        self.limit = max(1, int(self.raw_limit * max(0.1, min(safety, 1.0))))
+        self.events = []
+        self._lock = threading.Lock()
+
+    def _prune_locked(self):
+        cutoff = _time.time() - 60.0
+        self.events = [ts for ts in self.events if ts > cutoff]
+
+    def reserve(self):
+        while True:
+            with self._lock:
+                self._prune_locked()
+                if len(self.events) < self.limit:
+                    self.events.append(_time.time())
+                    return
+                wait = max(61.0 - (_time.time() - self.events[0]), 1.0)
+            print(
+                f"  [gemini-rpm] {len(self.events)}/{self.limit} requests used this minute - "
+                f"waiting {wait:.0f}s for the window to refill",
+                flush=True,
+            )
+            _time.sleep(wait)
+
+    def clear(self):
+        with self._lock:
+            self.events.clear()
+
+
+GEMINI_REQUEST_BUDGET = RequestBudget(GEMINI_RPM_LIMIT, GEMINI_RPM_SAFETY)
+
+
+def estimate_tokens(value) -> int:
+    """Pessimistic character estimate: roughly 3 characters per token."""
+    return max(1, len(str(value or "")) // 3)
+
+
+def estimate_messages_tokens(messages) -> int:
+    total = 0
+    for message in messages:
+        content = getattr(message, "content", message)
+        total += estimate_tokens(content) + 4
+        for tool_call in (getattr(message, "tool_calls", None) or []):
+            total += estimate_tokens(tool_call)
+    return total
+
+
+def parse_retry_after(error_text: str, default: float = 20.0) -> float:
+    """Parse Groq/OpenAI-style retry hints such as 'try again in 3.53s'."""
+    text = str(error_text or "")
+    m = re.search(r"try again in (\d+)m([\d.]+)s", text, re.I)
+    if m:
+        return float(m.group(1)) * 60.0 + float(m.group(2)) + 2.0
+    m = re.search(r"try again in ([\d.]+)\s*(ms|s|m)?", text, re.I)
+    if m:
+        value = float(m.group(1))
+        unit = (m.group(2) or "s").lower()
+        if unit == "ms":
+            value /= 1000.0
+        elif unit == "m":
+            value *= 60.0
+        return max(1.0, value + 2.0)
+    return float(default)
+
+
+def is_rate_limit(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(k in msg for k in ("rate limit", "rate_limit", "429", "too many requests", "resource_exhausted"))
+
+
+def safe_llm_call(messages, model=None, retries: int = 3) -> str:
+    """Compatibility helper for direct LLM calls. Provider fallback remains owned
+    by build_with_fallbacks; this helper only retries transient network failures.
+    """
+    runnable = model or resilient_model
+    for attempt in range(max(1, retries)):
+        try:
+            result = runnable.invoke(messages)
+            return extract_text(getattr(result, "content", result))
+        except Exception as exc:
+            msg = str(exc).lower()
+            transient = any(k in msg for k in (
+                "timeout", "overloaded", "503", "502", "connection", "temporarily unavailable"
+            ))
+            if not transient or attempt == retries - 1:
+                log_step("safe_llm_call: failed", f"{type(exc).__name__}: {_short_error(exc)}")
+                return ""
+            wait = 5.0 * (2 ** attempt) + random.uniform(0, 2)
+            log_step("safe_llm_call: transient retry", f"attempt={attempt + 1}/{retries}; waiting={wait:.1f}s")
+            _time.sleep(wait)
+    return ""
+
+
+def clip(text: str, n: int) -> str:
+    """Collapse whitespace and hard-truncate text to keep prompts bounded."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text[:max(0, int(n))]
+
+
+class RateLimitedGemini:
+    """Lightweight Gemini wrapper with shared TPM + RPM protection.
+
+    It wraps the actual LangChain Gemini runnable, including transformed
+    structured-output/tool runnables, so every Gemini request passes through the
+    same project-level local budget before reaching Google.
+    """
+
+    def __init__(self, runnable, label="gemini"):
+        self._runnable = runnable
+        self.label = label
+
+    def invoke(self, input_value, config=None, **kwargs):
+        estimated = estimate_messages_tokens(input_value) if isinstance(input_value, (list, tuple)) else estimate_tokens(input_value)
+        estimated += max(1, LLM_MAX_TOKENS)
+        for attempt in range(max(1, GEMINI_RATE_RETRIES)):
+            token_reservation = GEMINI_TOKEN_BUDGET.reserve(estimated)
+            GEMINI_REQUEST_BUDGET.reserve()
+            try:
+                result = self._runnable.invoke(input_value, config=config, **kwargs)
+                usage = getattr(result, "usage_metadata", None) or {}
+                actual = usage.get("total_tokens") or usage.get("total_token_count") or 0
+                if actual:
+                    GEMINI_TOKEN_BUDGET.settle(token_reservation, int(actual))
+                return result
+            except Exception as exc:
+                if not is_rate_limit(exc) or attempt == GEMINI_RATE_RETRIES - 1:
+                    raise
+                GEMINI_TOKEN_BUDGET.penalise(token_reservation)
+                wait = parse_retry_after(str(exc), default=10.0)
+                print(
+                    f"  [Gemini 429] rate limited - waiting {wait:.1f}s "
+                    f"(attempt {attempt + 1}/{GEMINI_RATE_RETRIES})",
+                    flush=True,
+                )
+                _time.sleep(wait)
+        raise RuntimeError("Exhausted Gemini rate-limit retries")
+
+    def with_structured_output(self, *args, **kwargs):
+        return RateLimitedGemini(
+            self._runnable.with_structured_output(*args, **kwargs), self.label
+        )
+
+    def bind_tools(self, *args, **kwargs):
+        return RateLimitedGemini(
+            self._runnable.bind_tools(*args, **kwargs), self.label
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._runnable, name)
+
+
+class RateLimitedChatGroq(ChatGroq):
+    """ChatGroq wrapper with a shared TPM budget and explicit 429 retry loop."""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        estimated = estimate_messages_tokens(messages) + max(1, int(self.max_tokens or 512))
+        for attempt in range(max(1, RATE_RETRIES)):
+            reservation_id = BUDGET.reserve(estimated)
+            try:
+                result = super()._generate(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+                try:
+                    usage = (result.llm_output or {}).get("token_usage", {})
+                    actual = usage.get("total_tokens", 0)
+                    if actual:
+                        BUDGET.settle(reservation_id, int(actual))
+                except Exception:
+                    pass
+                return result
+            except Exception as exc:
+                if not is_rate_limit(exc) or attempt == RATE_RETRIES - 1:
+                    raise
+                BUDGET.penalise(reservation_id)
+                wait = parse_retry_after(str(exc))
+                print(
+                    f"  [429] rate limited - waiting {wait:.1f}s "
+                    f"(attempt {attempt + 1}/{RATE_RETRIES})",
+                    flush=True,
+                )
+                _time.sleep(wait)
+        raise RuntimeError("Exhausted Groq rate-limit retries")
+
 
 def parse_model_chain(value) -> list:
-    """'a, b ,,c' -> ['a','b','c'] (order preserved, blanks and duplicates dropped)."""
     names = []
     for part in (value or "").split(","):
         part = part.strip()
@@ -95,43 +420,67 @@ def parse_model_chain(value) -> list:
             names.append(part)
     return names
 
+
 def _is_timeout_error(exc: Exception) -> bool:
     name = type(exc).__name__.lower()
-    text = str(exc).lower()
-    timeout_names = {"readtimeout", "connecttimeout", "writetimeout", "pooltimeout", "timeouterror", "timeout"}
-    return name in timeout_names or "readtimeout" in name or "time out" in text or "timed out" in text or "deadline_exceeded" in text
+    msg = str(exc).lower()
+    timeout_names = {
+        "readtimeout", "connecttimeout", "writetimeout", "pooltimeout",
+        "timeouterror", "timeout"
+    }
+    return (
+        name in timeout_names
+        or "readtimeout" in name
+        or "timed out" in msg
+        or "time out" in msg
+        or "deadline_exceeded" in msg
+        or "deadline exceeded" in msg
+    )
+
 
 def _short_error(exc: Exception) -> str:
     return str(exc).replace("\n", " ")[:300]
 
-def build_with_fallbacks(entries):
-    """Sequential provider fallback. Timeout -> retry same entry once; other provider errors -> next entry."""
+
+def build_with_fallbacks(entries, transform=None):
+    """Build a sequential provider fallback runnable."""
+    if not entries:
+        raise ValueError("No models configured in fallback chain")
+    if isinstance(entries[0], tuple):
+        normalized = list(entries)
+    else:
+        normalized = [(getattr(m, "model", None) or f"model-{i + 1}", m) for i, m in enumerate(entries)]
+    if transform:
+        normalized = [(label, transform(runnable)) for label, runnable in normalized]
+
     def invoke_with_fallbacks(input_value, config=None, **kwargs):
         last_error = None
-        for index, (label, runnable) in enumerate(entries):
+        for label, runnable in normalized:
             for attempt in (1, 2):
                 try:
-                    log_step("model fallback: trying", f"{label}" if attempt == 1 else f"{label} (retry {attempt}/2)")
+                    suffix = "" if attempt == 1 else " (retry 2/2)"
+                    log_step("model fallback: trying", f"{label}{suffix}")
                     return runnable.invoke(input_value, config=config, **kwargs)
                 except Exception as exc:
                     last_error = exc
                     if _is_timeout_error(exc) and attempt == 1:
                         log_step("model fallback: timeout", f"{label}; retrying same model once")
                         continue
-                    log_step("model fallback: failed", f"{label}; type={type(exc).__name__}; {_short_error(exc)}")
+                    log_step(
+                        "model fallback: failed",
+                        f"{label}; type={type(exc).__name__}; {_short_error(exc)}",
+                    )
                     break
         if last_error is not None:
             raise last_error
         raise RuntimeError("No models configured in fallback chain")
+
     return RunnableLambda(invoke_with_fallbacks)
 
-DEFAULT_TIMEOUT_SECONDS = 45
-DEFAULT_MODEL_TIMEOUTS = {
-    "gemini-3.8-flash": 45,
-    "gemini-3.5-flash-lite": 30,
-    "openai/gpt-oss-20b": 30,
-}
 
+# No artificial 30/45-second deadline. By default the provider/client decides
+# the actual request deadline. If you need an explicit deadline, set
+# MODEL_TIMEOUT_SECONDS or MODEL_TIMEOUTS in the environment.
 def parse_model_timeouts(value) -> dict:
     result = {}
     for part in (value or "").split(","):
@@ -146,34 +495,89 @@ def parse_model_timeouts(value) -> dict:
             result[name.strip()] = secs
     return result
 
-MODEL_TIMEOUTS = {**DEFAULT_MODEL_TIMEOUTS, **parse_model_timeouts(os.environ.get("MODEL_TIMEOUTS"))}
+
+MODEL_TIMEOUTS = parse_model_timeouts(os.environ.get("MODEL_TIMEOUTS"))
+DEFAULT_TIMEOUT_SECONDS = _safe_float_env("MODEL_TIMEOUT_SECONDS", 0)
+
 
 def get_model_timeout(name: str):
-    return MODEL_TIMEOUTS.get(name, DEFAULT_TIMEOUT_SECONDS)
+    value = MODEL_TIMEOUTS.get(name, DEFAULT_TIMEOUT_SECONDS)
+    return value if value > 0 else None
 
-gemini_names = parse_model_chain(os.environ.get("GEMINI_MODEL_CHAIN", DEFAULT_GEMINI_MODEL_CHAIN))
-groq_names = parse_model_chain(os.environ.get("GROQ_MODEL_CHAIN", DEFAULT_GROQ_MODEL_CHAIN))
+
+MODEL_CHAIN = parse_model_chain(
+    os.environ.get("GEMINI_MODEL_CHAIN", DEFAULT_GEMINI_MODEL_CHAIN)
+) or parse_model_chain(DEFAULT_GEMINI_MODEL_CHAIN)
+GROQ_MODEL_CHAIN = parse_model_chain(
+    os.environ.get("GROQ_MODEL_CHAIN", DEFAULT_GROQ_MODEL_CHAIN)
+) or parse_model_chain(DEFAULT_GROQ_MODEL_CHAIN)
+
+# Key loading is compatible with the user's previous setup:
+# 1) GROQ_API_KEY environment variable
+# 2) GROQ_API_KEY2 from Google Colab Secrets
+# 3) interactive getpass only when stdin is actually interactive
+# In Streamlit/non-interactive deployment, we do NOT block waiting for input;
+# Groq simply remains disabled if no key was configured.
+groq_key = os.environ.get("GROQ_API_KEY")
+if not groq_key:
+    try:
+        from google.colab import userdata
+        groq_key = userdata.get("GROQ_API_KEY2")
+    except Exception:
+        groq_key = None
+if not groq_key and sys.stdin is not None and sys.stdin.isatty():
+    try:
+        from getpass import getpass
+        groq_key = getpass("Enter your GROQ_API_KEY: ").strip()
+    except Exception:
+        groq_key = None
+if groq_key:
+    os.environ["GROQ_API_KEY"] = groq_key
+    print("Groq API key loaded.", flush=True)
+else:
+    os.environ.setdefault("GROQ_API_KEY", "")
+    log_step("model chain warning ->", "GROQ_API_KEY is not set; Groq fallback disabled")
 
 model_entries = []
-for name in gemini_names:
-    model_entries.append((f"gemini:{name}", init_chat_model(
-        model=name, model_provider="google_genai", api_key=gemini_key,
-        temperature=0, max_retries=0, timeout=get_model_timeout(name),
-    )))
+for name in MODEL_CHAIN:
+    kwargs = {
+        "model": name,
+        "model_provider": "google_genai",
+        "api_key": gemini_key,
+        "temperature": 0,
+        "max_retries": 0,
+        "max_tokens": LLM_MAX_TOKENS,
+    }
+    timeout = get_model_timeout(name)
+    if timeout:
+        kwargs["timeout"] = timeout
+    gemini_runnable = init_chat_model(**kwargs)
+    model_entries.append((f"gemini:{name}", RateLimitedGemini(gemini_runnable, f"gemini:{name}")))
 
 if groq_key:
-    for name in groq_names:
-        model_entries.append((f"groq:{name}", ChatGroq(
-            model=name, api_key=groq_key, temperature=0, max_retries=0,
-            timeout=get_model_timeout(name),
-        )))
-else:
-    log_step("model chain warning ->", "GROQ_API_KEY is not set; Groq fallback disabled")
+    for name in GROQ_MODEL_CHAIN:
+        kwargs = {
+            "model": name,
+            "api_key": groq_key,
+            "temperature": 0,
+            "max_retries": 0,
+            "max_tokens": LLM_MAX_TOKENS,
+        }
+        timeout = get_model_timeout(name)
+        if timeout:
+            kwargs["timeout"] = timeout
+        model_entries.append((f"groq:{name}", RateLimitedChatGroq(**kwargs)))
 
 if not model_entries:
     raise ValueError("No chat models are configured.")
 
-log_step("model chain ->", ", ".join(f"{label}({get_model_timeout(label.split(':',1)[-1]):g}s)" for label, _ in model_entries))
+chain_display = []
+for label, _ in model_entries:
+    model_name = label.split(":", 1)[-1]
+    timeout = get_model_timeout(model_name)
+    suffix = f"({timeout:g}s)" if timeout else "(provider-default-timeout)"
+    chain_display.append(f"{label}{suffix}")
+log_step("model chain ->", ", ".join(chain_display))
 models = [m for _, m in model_entries]
 model = models[0]
 resilient_model = build_with_fallbacks(model_entries)
@@ -184,10 +588,8 @@ class AgentState(TypedDict, total=False):
     cust_id: str
     category: str
     frustration_level: str
-    result_source: str       # SQL, RAG, REFUND, SYSTEM
-    result_data: object      # structured/raw result consumed only by formatter
-    rag_context: str         # retrieved policy context for the final formatter
-
+    result_source: str
+    result_data: object
 
 def get_session_config(cust_id: str, thread_id: str = None):
     """Builds the LangGraph config + initial state for one customer session.
@@ -293,13 +695,15 @@ def parse_sql_response(sql_response: str) -> dict:
 
 
 def refund_status_handler(state: AgentState):
-    """Convert the SQL result into structured facts; the shared formatter produces the final reply."""
+    """Convert SQL facts into structured refund facts; the shared formatter speaks to the customer."""
     log_step("refund_status_handler: evaluating SQL result")
     raw = extract_text(state.get("result_data", ""))
     parsed = parse_sql_response(raw)
     order_status = (parsed.get("order_status") or "").strip().lower()
 
-    if order_status in ("canceled", "cancelled"):
+    if raw == "NOT_FOUND":
+        result = {"type": "not_found", "message_basis": "No matching order was found for the authenticated customer."}
+    elif order_status in ("canceled", "cancelled"):
         result = {
             "type": "refund_status",
             "order_status": order_status,
@@ -307,8 +711,6 @@ def refund_status_handler(state: AgentState):
             "refund_timeline": "7–10 business days",
             "message_basis": "The order was cancelled; the refund is processed to the FoodHub Wallet within 7–10 business days."
         }
-    elif raw == "NOT_FOUND":
-        result = {"type": "not_found", "message_basis": "No matching order was found for the authenticated customer."}
     else:
         ticket_id = generate_ticket_id()
         result = {
@@ -319,9 +721,26 @@ def refund_status_handler(state: AgentState):
     return {"result_source": "REFUND", "result_data": result}
 
 
+_TIME_FORMATS = ("%H:%M", "%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S")
+
+
+def _parse_clock_time(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value or value.lower() in ("none", "null", "nan", "n/a"):
+        return None
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def refund_eligibility_handler(state: AgentState):
-    """Calculate refund eligibility from trusted SQL values; shared formatter gives the customer-facing answer."""
-    log_step("refund_eligibility_handler: calculating eligibility")
+    """Calculate eligibility deterministically from trusted SQL fields."""
+    log_step("refund_eligibility_handler: calculating lateness")
     raw = extract_text(state.get("result_data", ""))
     parsed = parse_sql_response(raw)
     eta = _parse_clock_time(parsed.get("delivery_eta"))
@@ -352,12 +771,12 @@ def refund_eligibility_handler(state: AgentState):
         }
     return {"result_source": "REFUND", "result_data": result}
 
-# The SQL path is single-pass. We expose one tool schema to the SQL LLM so it
-# produces one SELECT; sql_node() executes that query directly and exactly once.
-@tool("sql_db_query")
-def sql_query_tool(query: str) -> str:
-    """Generate exactly one read-only SELECT for the authenticated customer's orders table."""
-    return query
+sql_toolkit = SQLDatabaseToolkit(db=db, llm=model)
+
+sql_tools = sql_toolkit.get_tools()
+sql_query_tool = next((t for t in sql_tools if getattr(t, "name", "") == "sql_db_query"), None)
+if sql_query_tool is None:
+    raise RuntimeError("sql_db_query tool is unavailable in SQLDatabaseToolkit")
 
 # Forces the classifier's output into exactly these two fields, each from a fixed
 # set of allowed values — never free text the rest of the graph would have to parse.
@@ -486,12 +905,14 @@ that judgment."""
     result = groundedness_judge.invoke(prompt)
     return result
 
-classifier_entries = [(label, m.with_structured_output(ClassifierSchema, method="json_schema")) for (label, m) in model_entries]
+classifier_entries = [(label, m.with_structured_output(ClassifierSchema)) for label, m in model_entries]
 classifier_model = build_with_fallbacks(classifier_entries)
-SQL_entries = [(label, m.bind_tools([sql_query_tool])) for (label, m) in model_entries]
+SQL_entries = [(label, m.bind_tools([sql_query_tool])) for label, m in model_entries]
 SQL_model = build_with_fallbacks(SQL_entries)
-relevance_judge = build_with_fallbacks(models, lambda m: m.with_structured_output(RelevanceScore))
-groundedness_judge = build_with_fallbacks(models, lambda m: m.with_structured_output(GroundednessScore))
+relevance_entries = [(label, m.with_structured_output(RelevanceScore)) for label, m in model_entries]
+relevance_judge = build_with_fallbacks(relevance_entries)
+groundedness_entries = [(label, m.with_structured_output(GroundednessScore)) for label, m in model_entries]
+groundedness_judge = build_with_fallbacks(groundedness_entries)
 
 
 Classifier_prompt = """
@@ -638,6 +1059,9 @@ RESTRICTIONS:
 - If a query fails to execute, respond with exactly: QUERY_ERROR
   Do not include the raw database error message or the SQL text in your response.
 
+DATABASE SCHEMA (orders table only):
+{schema}
+
 OUTPUT FORMAT:
 Return the requested values as labeled key:value pairs, comma-separated
 (e.g. "order_id: 1042, order_status: out_for_delivery, delivery_eta: 14:30").
@@ -677,6 +1101,9 @@ CUSTOMER QUESTION:
 {question}
 """
 def router(state: AgentState):
+    """Conditional-edge function: reads state and returns the NAME of the next
+    node to run. Never updates state itself — routing decisions and state
+    updates are kept separate."""
     if state['category'] in ["STATUS", "REFUND_ELIGIBILITY", "REFUND_STATUS_CHECK"]:
         dest = "sql_agent"
     elif state['category'] == "POLICY":
@@ -687,7 +1114,7 @@ def router(state: AgentState):
         dest = "escalation_agent"
     elif state['category'] in ["OUT_OF_SCOPE", "MALICIOUS"]:
         dest = "blocked_response_node"
-    else:
+    else:  # NOT_CLEAR
         dest = "clarify_node"
     log_step("router: routing to ->", dest)
     return dest
@@ -695,31 +1122,33 @@ def router(state: AgentState):
 
 def post_sql_route_fn(state: AgentState):
     category = state["category"]
-    if category == "REFUND_STATUS_CHECK":
-        return "refund_status_handler"
-    if category == "REFUND_ELIGIBILITY":
-        return "refund_eligibility_handler"
-    return "formatter_node"
+
+    # Both of these categories deal with quality/disputes that need a ticket
+    if category in ["REFUND_STATUS_CHECK", "ESCALATION"]:
+        dest = "refund_status_handler"
+    elif category == "REFUND_ELIGIBILITY":
+        dest = "refund_eligibility_handler"
+    else:
+        dest = "end"
+    log_step("post_sql_route_fn: routing to ->", dest)
+    return dest
 
 
 def passthrough(state: AgentState):
+    """No-op node — exists only to give the post-SQL conditional router a real
+    node to attach to, since LangGraph conditional edges require a source node."""
     return {}
 
 
-def _latest_user_question(state: AgentState) -> str:
-    for msg in reversed(state.get("messages", [])):
-        if isinstance(msg, HumanMessage):
-            return extract_text(msg.content)
-    return ""
-
-
 def classifier_node(state: AgentState):
+    """The only node that reads the message with the classification system prompt.
+    Writes to `category`/`frustration_level`, NOT `messages` — a routing label is
+    not a conversational message and should not enter the chat history."""
     log_step("classifier_node: calling classifier_model.invoke...")
     messages = [SystemMessage(content=Classifier_prompt)] + state['messages']
     result = classifier_model.invoke(messages)
     log_step("classifier_node: done ->", f"category={result.category}, frustration={result.frustration_level}")
     return {"category": result.category, "frustration_level": result.frustration_level}
-
 
 def _safe_customer_query(query: str, cust_id: str) -> str:
     """Execute exactly one read-only SELECT scoped to the authenticated customer."""
@@ -730,9 +1159,9 @@ def _safe_customer_query(query: str, cust_id: str) -> str:
     if not re.search(r"\bfrom\s+orders\b", q_low):
         return "QUERY_ERROR"
     escaped = re.escape(str(cust_id))
-    if not re.search(rf"\bcustomer_id\s*=\s*[\x22\x27]?{escaped}[\x22\x27]?", q, flags=re.IGNORECASE):
+    if not re.search(rf"\bcustomer_id\s*=\s*[\"']?{escaped}[\"']?", q, flags=re.IGNORECASE):
         return "QUERY_ERROR"
-    if re.search(r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma)\b", q_low):
+    if re.search(r"\b(insert|update|delete|drop|alter|create|replace|attach|detach|pragma|vacuum)\b", q_low):
         return "QUERY_ERROR"
     try:
         uri = f"file:{DB_PATH}?mode=ro"
@@ -746,8 +1175,6 @@ def _safe_customer_query(query: str, cust_id: str) -> str:
         return "QUERY_ERROR"
     if not rows:
         return "NOT_FOUND"
-    # One DB execution only. Keep all returned rows so the formatter can handle
-    # list-style questions (e.g. recent orders) without another SQL call.
     return "\n".join(
         ", ".join(f"{col}: {val}" for col, val in zip(columns, row))
         for row in rows
@@ -755,16 +1182,21 @@ def _safe_customer_query(query: str, cust_id: str) -> str:
 
 
 def sql_node(state: AgentState):
-    """One SQL-generation LLM call, followed by one customer-scoped DB execution. No tool loop."""
+    """One SQL-generation LLM call, then one customer-scoped DB execution. No ToolNode loop."""
     log_step("sql_node: calling SQL_model.invoke...")
-    messages = [SystemMessage(content=SQL_AGENT_PROMPT.format(cust_id=state['cust_id']))] + state['messages']
+    try:
+        schema = db.get_table_info(["orders"])
+    except Exception:
+        schema = "orders table schema could not be loaded; use only fields known from the prompt and SELECT only."
+    prompt = SQL_AGENT_PROMPT.format(cust_id=state["cust_id"], schema=schema)
+    messages = [SystemMessage(content=prompt)] + state["messages"]
     result = SQL_model.invoke(messages)
     tool_calls = getattr(result, "tool_calls", None) or []
     log_step("sql_node: done ->", f"tool_calls={len(tool_calls)}")
 
     if not tool_calls:
-        text = extract_text(getattr(result, "content", "")) or "QUERY_ERROR"
-        return {"result_source": "SQL", "result_data": text}
+        raw = extract_text(getattr(result, "content", "")).strip()
+        return {"result_source": "SQL", "result_data": raw or "QUERY_ERROR"}
 
     call = tool_calls[0]
     args = call.get("args", {}) if isinstance(call, dict) else getattr(call, "args", {})
@@ -779,36 +1211,15 @@ def sql_node(state: AgentState):
     log_step("sql_node: database result ->", sql_result[:200])
     return {"result_source": "SQL", "result_data": sql_result}
 
-PDF_PATH = os.path.join(BASE_DIR, "data", "Food_Delivery_Policy_final.pdf")
-retriever = get_retreiver(PDF_PATH)
-
-def rag_node(state: AgentState):
-    """Retrieve and verify relevance only. The shared final formatter performs the single customer-facing generation."""
-    log_step("rag_node: retrieving from vector store...")
-    question = _latest_user_question(state)
-    docs = retriever.invoke(question)
-    contexts = [d.page_content for d in docs]
-    log_step("rag_node: retrieved", f"{len(contexts)} chunks")
-
-    if not contexts:
-        ticket_id = generate_ticket_id()
-        return {"result_source": "SYSTEM", "result_data": {"type": "manual_review", "ticket_id": ticket_id, "message_basis": "No policy information was retrieved."}}
-
-    log_step("rag_node: checking relevance...")
-    relevance_result = check_relevance(question, contexts)
-    log_step("rag_node: relevance result ->", f"score={relevance_result.score}, confidence={relevance_result.confidence}")
-    if relevance_result.score != "RELEVANT" or relevance_result.confidence < 0.5:
-        ticket_id = generate_ticket_id()
-        return {"result_source": "SYSTEM", "result_data": {"type": "manual_review", "ticket_id": ticket_id, "message_basis": "The available policy information was not sufficiently relevant to answer safely."}}
-
-    return {
-        "result_source": "RAG",
-        "result_data": {"question": question, "context": "\n\n".join(contexts)}
-    }
+def _latest_user_question(state: AgentState) -> str:
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            return extract_text(msg.content)
+    return ""
 
 
 def formatter_node(state: AgentState):
-    """Single shared final LLM formatter for SQL, RAG and refund-agent results."""
+    """Single shared customer-facing LLM generation for SQL, RAG and refund results."""
     source = state.get("result_source", "SYSTEM")
     data = state.get("result_data", "")
     question = _latest_user_question(state)
@@ -854,7 +1265,7 @@ RAG RESULTS:
 - Do not cite or mention the source document.
 
 REFUND RESULTS:
-- Preserve the calculated eligibility, delay, refund percentage, and ticket information exactly.
+- Preserve calculated eligibility, delay, refund percentage, and ticket information exactly.
 
 CUSTOMER QUESTION:
 {question}
@@ -870,8 +1281,6 @@ RESULT DATA / POLICY CONTEXT:
     if not answer:
         answer = "I'm sorry, but I couldn't prepare a response from the available information."
 
-    # RAG gets a post-generation groundedness check, but there is still only one
-    # customer-facing formatter generation. A failed check never triggers a second formatter.
     if source == "RAG" and isinstance(data, dict):
         try:
             grd = check_groundedness(question, [data.get("context", "")], answer)
@@ -880,14 +1289,54 @@ RESULT DATA / POLICY CONTEXT:
                 ticket_id = generate_ticket_id()
                 answer = f"I want to make sure you receive accurate information. I've raised a service ticket ({ticket_id}) for review."
         except Exception as exc:
-            # A failed safety judge must never re-run the formatter or expose a
-            # provider error to the customer; fail closed with a manual-review ticket.
             log_step("formatter_node: groundedness check failed", _short_error(exc))
             ticket_id = generate_ticket_id()
             answer = f"I want to make sure you receive accurate information. I've raised a service ticket ({ticket_id}) for review."
 
     log_step("formatter_node: done")
     return {"messages": [AIMessage(content=answer)]}
+
+PDF_PATH = os.path.join(BASE_DIR, "data", "Food_Delivery_Policy_final.pdf")
+retriever = get_retreiver(PDF_PATH)
+
+def rag_node(state: AgentState):
+    """Retrieve policy context and verify relevance; shared formatter generates the reply."""
+    log_step("rag_node: retrieving from vector store...")
+    question = _latest_user_question(state)
+    docs = retriever.invoke(question)
+    contexts = [d.page_content for d in docs]
+    log_step("rag_node: retrieved", f"{len(contexts)} chunks")
+
+    if not contexts:
+        ticket_id = generate_ticket_id()
+        return {
+            "result_source": "SYSTEM",
+            "result_data": {
+                "type": "manual_review",
+                "ticket_id": ticket_id,
+                "message_basis": "No policy information was retrieved."
+            }
+        }
+
+    log_step("rag_node: checking relevance...")
+    relevance_result = check_relevance(question, contexts)
+    log_step("rag_node: relevance result ->", f"score={relevance_result.score}, confidence={relevance_result.confidence}")
+    if relevance_result.score != "RELEVANT" or relevance_result.confidence < 0.5:
+        ticket_id = generate_ticket_id()
+        return {
+            "result_source": "SYSTEM",
+            "result_data": {
+                "type": "manual_review",
+                "ticket_id": ticket_id,
+                "message_basis": "The available policy information was not sufficiently relevant to answer safely."
+            }
+        }
+
+    return {
+        "result_source": "RAG",
+        "result_data": {"question": question, "context": "\n\n".join(contexts)}
+    }
+
 
 workflow = StateGraph(AgentState)
 
@@ -905,13 +1354,11 @@ workflow.add_node("post_sql_router", passthrough)
 
 workflow.add_edge(START, "classifier_agent")
 workflow.add_conditional_edges("classifier_agent", router)
-
-# Deterministic paths can terminate directly; SQL/RAG/refund paths always use the
-# one shared final formatter immediately before the customer response.
 workflow.add_edge("payment_failure_node", END)
 workflow.add_edge("escalation_agent", END)
 workflow.add_edge("blocked_response_node", END)
 workflow.add_edge("clarify_node", END)
+
 workflow.add_edge("sql_agent", "post_sql_router")
 workflow.add_conditional_edges("post_sql_router", post_sql_route_fn, path_map={
     "refund_status_handler": "refund_status_handler",
@@ -925,12 +1372,13 @@ workflow.add_edge("formatter_node", END)
 
 app = workflow.compile(checkpointer=MemorySaver())
 
+
 def get_bot_response(cust_id: str, user_input: str, thread_id: str) -> str:
     log_step("get_bot_response: START", f"cust_id={cust_id}, thread_id={thread_id}, input={user_input[:60]!r}")
     start_time = _time.time()
     try:
         config, initial_state, _ = get_session_config(cust_id, thread_id=thread_id)
-        config["recursion_limit"] = 15  # fail fast instead of looping silently forever
+        config["recursion_limit"] = max(1, AGENT_RECURSION_LIMIT)
         result = app.invoke(
             {"messages": [HumanMessage(content=user_input)], **initial_state},
             config=config,
