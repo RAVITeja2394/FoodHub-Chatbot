@@ -943,7 +943,7 @@ def write_saved_fingerprint(persist_dir, fingerprint):
         json.dump({"fingerprint": fingerprint}, f)
 
 
-def get_retreiver(file_path, chunk_size=1000, chunk_overlap=150, k=3, api_key=gemini_key, persist_dir=CHROMA_DIR):
+def get_retreiver(file_path, chunk_size=1000, chunk_overlap=150, k=3, api_key=gemini_key, persist_dir=CHROMA_DIR,force_rebuild=False):
     """Returns a Chroma retriever over the FoodHub policy PDF.
     The index is PERSISTED on disk and reused on every later start; it is rebuilt (re-embedded)
     only when the PDF, chunking settings or embedding model change. Chunked with
@@ -952,7 +952,7 @@ def get_retreiver(file_path, chunk_size=1000, chunk_overlap=150, k=3, api_key=ge
     fingerprint = compute_index_fingerprint(file_path, chunk_size, chunk_overlap, EMBED_MODEL)
 
     # 1. Reuse the stored index if it matches the current PDF/settings
-    if read_saved_fingerprint(persist_dir) == fingerprint:
+    if not force_rebuild and read_saved_fingerprint(persist_dir) == fingerprint:
         try:
             vec_db = Chroma(collection_name=CHROMA_COLLECTION, embedding_function=embeddings, persist_directory=persist_dir)
             if vec_db.get(limit=1)["ids"]:
@@ -965,7 +965,17 @@ def get_retreiver(file_path, chunk_size=1000, chunk_overlap=150, k=3, api_key=ge
     # 2. Build (re-embed) from the PDF
     log_step("get_retreiver: building index from PDF (embedding chunks)...")
     file_loader = PyMuPDF4LLMLoader(file_path).load()
+    log_step(
+    "get_retreiver: raw PDF documents",
+    f"count={len(file_loader)}, "
+    f"sample={[doc.page_content[:500] for doc in file_loader[:3]]}"
+)
     chunks = MarkdownTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap).split_documents(file_loader)
+    log_step(
+    "get_retreiver: chunks before embedding",
+    f"count={len(chunks)}, "
+    f"sample={[doc.page_content[:500] for doc in chunks[:3]]}"
+)
     try:
         shutil.rmtree(persist_dir, ignore_errors=True)       # drop the stale index entirely
         os.makedirs(persist_dir, exist_ok=True)
@@ -1546,7 +1556,7 @@ RESULT DATA / POLICY CONTEXT:
     return {"messages": [AIMessage(content=answer)]}
 
 PDF_PATH = os.path.join(BASE_DIR, "data", "Food_Delivery_Policy_final.pdf")
-retriever = get_retreiver(PDF_PATH)
+retriever = get_retreiver(PDF_PATH,force_rebuild=True)
 
 def rag_node(state: AgentState):
     """Retrieve policy context and verify relevance; shared formatter generates the reply."""
