@@ -1555,6 +1555,15 @@ def rag_node(state: AgentState):
     docs = retriever.invoke(question)
     contexts = [d.page_content for d in docs]
     log_step("rag_node: retrieved", f"{len(contexts)} chunks")
+    for i, doc in enumerate(docs, start=1):
+        log_step(
+        f"rag_node: chunk {i}",
+        (doc.page_content or "").replace("\n", " ")[:1500]
+    )
+        log_step(
+        f"rag_node: chunk {i} metadata",
+        str(doc.metadata)
+    )
 
     if not contexts:
         ticket_id = generate_ticket_id()
@@ -1568,18 +1577,33 @@ def rag_node(state: AgentState):
         }
 
     log_step("rag_node: checking relevance...")
+
     relevance_result = check_relevance(question, contexts)
-    log_step("rag_node: relevance result ->", f"score={relevance_result.score}, confidence={relevance_result.confidence}")
+
+    log_step(
+    "rag_node: relevance result ->",
+    f"score={relevance_result.score}, "
+    f"confidence={relevance_result.confidence}"
+    )
+
+    log_step(
+    "rag_node: relevance decision ->",
+    f"score={relevance_result.score}, "
+    f"confidence={relevance_result.confidence}, "
+    f"threshold=0.50, "
+    f"accepted={relevance_result.score == 'RELEVANT' and relevance_result.confidence >= 0.5}"
+    )
+
     if relevance_result.score != "RELEVANT" or relevance_result.confidence < 0.5:
         ticket_id = generate_ticket_id()
         return {
-            "result_source": "SYSTEM",
-            "result_data": {
-                "type": "manual_review",
-                "ticket_id": ticket_id,
-                "message_basis": "The available policy information was not sufficiently relevant to answer safely."
-            }
+        "result_source": "SYSTEM",
+        "result_data": {
+            "type": "manual_review",
+            "ticket_id": ticket_id,
+            "message_basis": "The available policy information was not sufficiently relevant to answer safely."
         }
+    }
 
     return {
         "result_source": "RAG",
